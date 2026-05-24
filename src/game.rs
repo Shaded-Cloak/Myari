@@ -297,6 +297,7 @@ fn find_best_start(
             TerrainType::Frostmoor => 4,
             TerrainType::Snowfield => 3,
             TerrainType::Coast => 4,
+            TerrainType::Beach => 3,
             _ => 0,
         };
 
@@ -342,6 +343,7 @@ pub fn is_walkable(terrain: TerrainType) -> bool {
             | TerrainType::Darkpine
             | TerrainType::Hills
             | TerrainType::Coast
+            | TerrainType::Beach
             | TerrainType::AncientRuin
             | TerrainType::LeyGrove
             | TerrainType::RuinField
@@ -354,6 +356,7 @@ pub fn terrain_yields(terrain: TerrainType) -> Yields {
     match terrain {
         TerrainType::DeepOcean | TerrainType::Ocean => Yields::default(),
         TerrainType::Coast => Yields { food: 1, production: 0, gold: 2 },
+        TerrainType::Beach => Yields { food: 1, production: 0, gold: 1 },
         TerrainType::Ashplain => Yields { food: 1, production: 0, gold: 0 },
         TerrainType::Thornveld => Yields { food: 1, production: 0, gold: 0 },
         TerrainType::Deepjungle => Yields { food: 2, production: 0, gold: 1 },
