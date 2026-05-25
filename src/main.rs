@@ -49,7 +49,7 @@ fn main() {
                 sync_zoom_from_camera,
                 track_hover,
                 highlight_hover,
-                update_hover_tile_text,
+                update_hover_panel,
                 handle_selection,
                 move_selected_unit,
                 toggle_menu,
@@ -130,7 +130,22 @@ struct SeedText;
 struct WorldEntity;
 
 #[derive(Component)]
-struct HoverTileText;
+struct HoverPanel;
+
+#[derive(Component)]
+struct HoverSwatch;
+
+#[derive(Component)]
+struct HoverNameText;
+
+#[derive(Component)]
+struct HoverCategoryText;
+
+#[derive(Component)]
+struct HoverCoordsText;
+
+#[derive(Component)]
+struct HoverEmptyHint;
 
 #[derive(Component)]
 struct UnitMarker {
@@ -233,21 +248,136 @@ fn spawn_map_and_game(
         Highlight,
     ));
 
-    commands.spawn((
-        Text::new("Hover: --"),
-        TextFont {
-            font_size: 16.0,
-            ..default()
-        },
-        TextColor(Color::srgb(0.92, 0.92, 0.92)),
-        Node {
-            position_type: PositionType::Absolute,
-            left: Val::Px(10.0),
-            bottom: Val::Px(10.0),
-            ..default()
-        },
-        HoverTileText,
-    ));
+    spawn_hover_panel(&mut commands);
+}
+
+fn spawn_hover_panel(commands: &mut Commands) {
+    let label_style = |size: f32| TextFont {
+        font_size: size,
+        ..default()
+    };
+    let muted = Color::srgb(0.52, 0.56, 0.64);
+    let bright = Color::srgb(0.94, 0.95, 0.97);
+    let accent = Color::srgb(0.72, 0.78, 0.88);
+
+    commands
+        .spawn((
+            Node {
+                position_type: PositionType::Absolute,
+                left: Val::Px(16.0),
+                bottom: Val::Px(16.0),
+                width: Val::Px(240.0),
+                flex_direction: FlexDirection::Column,
+                padding: UiRect::all(Val::Px(14.0)),
+                row_gap: Val::Px(10.0),
+                border: UiRect::all(Val::Px(1.0)),
+                ..default()
+            },
+            BackgroundColor(Color::srgba(0.07, 0.08, 0.11, 0.94)),
+            BorderColor(Color::srgb(0.28, 0.32, 0.40)),
+            BorderRadius::all(Val::Px(10.0)),
+            HoverPanel,
+        ))
+        .with_children(|panel| {
+            panel.spawn((
+                Text::new("TILE"),
+                label_style(11.0),
+                TextColor(muted),
+            ));
+
+            panel
+                .spawn((
+                    Node {
+                        width: Val::Percent(100.0),
+                        flex_direction: FlexDirection::Row,
+                        column_gap: Val::Px(12.0),
+                        align_items: AlignItems::Center,
+                        ..default()
+                    },
+                ))
+                .with_children(|row| {
+                    row.spawn((
+                        Node {
+                            width: Val::Px(14.0),
+                            height: Val::Px(14.0),
+                            border: UiRect::all(Val::Px(1.0)),
+                            ..default()
+                        },
+                        BackgroundColor(Color::srgb(0.35, 0.38, 0.45)),
+                        BorderColor(Color::srgba(1.0, 1.0, 1.0, 0.15)),
+                        BorderRadius::all(Val::Px(3.0)),
+                        HoverSwatch,
+                    ));
+                    row.spawn((
+                        Text::new("—"),
+                        label_style(20.0),
+                        TextColor(bright),
+                        HoverNameText,
+                    ));
+                });
+
+            panel
+                .spawn((
+                    Node {
+                        width: Val::Percent(100.0),
+                        flex_direction: FlexDirection::Column,
+                        row_gap: Val::Px(4.0),
+                        ..default()
+                    },
+                ))
+                .with_children(|block| {
+                    block.spawn((
+                        Text::new("TYPE"),
+                        label_style(11.0),
+                        TextColor(muted),
+                    ));
+                    block.spawn((
+                        Text::new("—"),
+                        label_style(15.0),
+                        TextColor(accent),
+                        HoverCategoryText,
+                    ));
+                });
+
+            panel.spawn((
+                Node {
+                    width: Val::Percent(100.0),
+                    height: Val::Px(1.0),
+                    ..default()
+                },
+                BackgroundColor(Color::srgba(1.0, 1.0, 1.0, 0.08)),
+            ));
+
+            panel
+                .spawn((
+                    Node {
+                        width: Val::Percent(100.0),
+                        flex_direction: FlexDirection::Column,
+                        row_gap: Val::Px(4.0),
+                        ..default()
+                    },
+                ))
+                .with_children(|block| {
+                    block.spawn((
+                        Text::new("COORDINATES"),
+                        label_style(11.0),
+                        TextColor(muted),
+                    ));
+                    block.spawn((
+                        Text::new("q —  ·  r —"),
+                        label_style(14.0),
+                        TextColor(Color::srgb(0.78, 0.81, 0.86)),
+                        HoverCoordsText,
+                    ));
+                });
+
+            panel.spawn((
+                Text::new("Move cursor over a hex"),
+                label_style(12.0),
+                TextColor(Color::srgb(0.42, 0.45, 0.52)),
+                HoverEmptyHint,
+            ));
+        });
 }
 
 fn default_save_path() -> String {
@@ -830,37 +960,62 @@ fn handle_toggle_button(
     }
 }
 
-fn update_hover_tile_text(
+fn update_hover_panel(
     hovered: Res<HoveredHex>,
     map: Res<GameMap>,
-    mut query: Query<&mut Text, With<HoverTileText>>,
+    mut name: Query<&mut Text, (With<HoverNameText>, Without<HoverCategoryText>)>,
+    mut category: Query<&mut Text, (With<HoverCategoryText>, Without<HoverNameText>)>,
+    mut coords: Query<&mut Text, With<HoverCoordsText>>,
+    mut swatch: Query<&mut BackgroundColor, With<HoverSwatch>>,
+    mut hint: Query<&mut Visibility, With<HoverEmptyHint>>,
     mut prev: Local<Option<HexCoord>>,
 ) {
-    // Only rebuild the formatted string when the hovered tile actually
-    // changes — saves per-frame allocations and `tile_at` lookups.
     if *prev == hovered.0 {
         return;
     }
     *prev = hovered.0;
-    let Ok(mut text) = query.get_single_mut() else {
+
+    let Ok(mut name) = name.get_single_mut() else {
+        return;
+    };
+    let Ok(mut category) = category.get_single_mut() else {
+        return;
+    };
+    let Ok(mut coords) = coords.get_single_mut() else {
+        return;
+    };
+    let Ok(mut swatch) = swatch.get_single_mut() else {
+        return;
+    };
+    let Ok(mut hint) = hint.get_single_mut() else {
         return;
     };
 
     let Some(coord) = hovered.0 else {
-        text.0 = "Hover: --".to_string();
+        *hint = Visibility::Visible;
+        name.0 = "—".to_string();
+        category.0 = "—".to_string();
+        coords.0 = "q —  ·  r —".to_string();
+        swatch.0 = Color::srgb(0.35, 0.38, 0.45);
         return;
     };
 
-    if let Some(tile) = map.0.tile_at(coord) {
-        text.0 = format!(
-            "Hover: {}  |  q={}, r={}",
-            terrain_label(tile.terrain),
-            coord.q,
-            coord.r
-        );
-    } else {
-        text.0 = format!("Hover: Out of map  |  q={}, r={}", coord.q, coord.r);
-    }
+    *hint = Visibility::Hidden;
+
+    let Some(tile) = map.0.tile_at(coord) else {
+        name.0 = "Out of map".to_string();
+        category.0 = "—".to_string();
+        coords.0 = format!("q {}  ·  r {}", coord.q, coord.r);
+        swatch.0 = Color::srgb(0.35, 0.38, 0.45);
+        return;
+    };
+
+    name.0 = terrain_label(tile.terrain).to_string();
+    category.0 = terrain_category(tile.terrain)
+        .map(str::to_string)
+        .unwrap_or_else(|| "Other".to_string());
+    coords.0 = format!("q {}  ·  r {}", coord.q, coord.r);
+    swatch.0 = terrain_to_color(tile.terrain);
 }
 
 fn terrain_label(t: TerrainType) -> &'static str {
@@ -893,6 +1048,20 @@ fn terrain_label(t: TerrainType) -> &'static str {
         TerrainType::BlightedWaste => "Blighted Waste",
         TerrainType::RuinField => "Ruin Field",
         TerrainType::SacredGround => "Sacred Ground",
+    }
+}
+
+fn terrain_category(t: TerrainType) -> Option<&'static str> {
+    match t {
+        TerrainType::Plains | TerrainType::Greenfield => Some("Base"),
+        TerrainType::DeepOcean
+        | TerrainType::Ocean
+        | TerrainType::Coast
+        | TerrainType::Freshwater => Some("Water"),
+        TerrainType::SnowPeak | TerrainType::StonySlope => Some("Mountain"),
+        TerrainType::Beach => Some("Shore"),
+        TerrainType::Oldwood | TerrainType::Darkpine | TerrainType::Deepjungle => Some("Forest"),
+        _ => None,
     }
 }
 
