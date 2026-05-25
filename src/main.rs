@@ -367,9 +367,13 @@ fn spawn_world_visuals(
         WorldEntity,
     ));
 
-    spawn_civ_markers(commands, meshes, materials, gs);
+    // Civilization city/unit markers temporarily disabled — game state still
+    // tracks them, but we don't draw the red/blue/green dots yet.
+    // spawn_civ_markers(commands, meshes, materials, gs);
+    let _ = (commands, meshes, materials, gs);
 }
 
+#[allow(dead_code)] // temporarily disabled — see spawn_world_visuals
 fn spawn_civ_markers(
     commands: &mut Commands,
     meshes: &mut ResMut<Assets<Mesh>>,
@@ -449,9 +453,13 @@ fn make_hex_outline_mesh(size: f32) -> Mesh {
 }
 
 fn make_combined_hex_mesh(tiles: &[HexTile], size: f32) -> Mesh {
-    let mut positions: Vec<[f32; 3]> = Vec::new();
-    let mut colors: Vec<[f32; 4]> = Vec::new();
-    let mut indices: Vec<u32> = Vec::new();
+    // 7 vertices per tile (center + 6 corners), 18 indices per tile
+    // (6 triangles, 3 verts each). Pre-reserving prevents the dozen-or-so
+    // realloc/copy cycles a Vec would otherwise do when growing to ~1M verts.
+    let n = tiles.len();
+    let mut positions: Vec<[f32; 3]> = Vec::with_capacity(n * 7);
+    let mut colors: Vec<[f32; 4]> = Vec::with_capacity(n * 7);
+    let mut indices: Vec<u32> = Vec::with_capacity(n * 18);
     let mut base: u32 = 0;
 
     for tile in tiles {
@@ -484,8 +492,10 @@ fn make_combined_hex_mesh(tiles: &[HexTile], size: f32) -> Mesh {
 }
 
 fn make_grid_mesh(tiles: &[HexTile], size: f32) -> Mesh {
-    let mut positions: Vec<[f32; 3]> = Vec::new();
-    let mut seen: HashSet<((i32, i32), (i32, i32))> = HashSet::new();
+    // ~3 unique edges per tile on average. Pre-size accordingly.
+    let n = tiles.len();
+    let mut positions: Vec<[f32; 3]> = Vec::with_capacity(n * 6);
+    let mut seen: HashSet<((i32, i32), (i32, i32))> = HashSet::with_capacity(n * 3);
     let edge_key = |a: HexCoord, b: HexCoord| -> ((i32, i32), (i32, i32)) {
         let aa = (a.q, a.r);
         let bb = (b.q, b.r);
@@ -519,6 +529,7 @@ fn terrain_to_color(t: TerrainType) -> Color {
         TerrainType::DeepOcean => Color::srgb_u8(0x0d, 0x1b, 0x3e),
         TerrainType::Ocean => Color::srgb_u8(0x1a, 0x30, 0x60),
         TerrainType::Coast => Color::srgb_u8(0x2e, 0x6e, 0xa6),
+        TerrainType::Freshwater => Color::srgb_u8(0x4a, 0xa0, 0xd0),
         TerrainType::Beach => Color::srgb_u8(0xc2, 0xa9, 0x6e),
         TerrainType::Hills => Color::srgb_u8(0x7a, 0x6a, 0x4a),
         TerrainType::Mountain => Color::srgb_u8(0x5a, 0x5a, 0x5a),
@@ -742,12 +753,32 @@ fn spawn_menu(mut commands: Commands) {
 
 fn toggle_menu(
     keys: Res<ButtonInput<KeyCode>>,
+    time: Res<Time>,
     mut menu_open: ResMut<MenuOpen>,
     mut query: Query<&mut Node, With<MenuRoot>>,
+    mut was_pressed: Local<bool>,
+    mut last_toggle: Local<f32>,
 ) {
-    if !keys.just_pressed(KeyCode::Escape) {
+    // Two-belt defence against Escape double-toggling:
+    //   1. Rising-edge detector — must release before toggling again.
+    //   2. 200 ms cooldown after each toggle — covers any case where the key
+    //      state appears to flicker (e.g. OS key auto-repeat surfacing as a
+    //      release+press pair within a single tick).
+    let is_pressed = keys.pressed(KeyCode::Escape);
+    if !is_pressed {
+        *was_pressed = false;
         return;
     }
+    if *was_pressed {
+        return;
+    }
+    let now = time.elapsed_secs();
+    if now - *last_toggle < 0.2 {
+        return;
+    }
+    *was_pressed = true;
+    *last_toggle = now;
+
     menu_open.0 = !menu_open.0;
     if let Ok(mut node) = query.get_single_mut() {
         node.display = if menu_open.0 {
@@ -803,7 +834,14 @@ fn update_hover_tile_text(
     hovered: Res<HoveredHex>,
     map: Res<GameMap>,
     mut query: Query<&mut Text, With<HoverTileText>>,
+    mut prev: Local<Option<HexCoord>>,
 ) {
+    // Only rebuild the formatted string when the hovered tile actually
+    // changes — saves per-frame allocations and `tile_at` lookups.
+    if *prev == hovered.0 {
+        return;
+    }
+    *prev = hovered.0;
     let Ok(mut text) = query.get_single_mut() else {
         return;
     };
@@ -830,6 +868,7 @@ fn terrain_label(t: TerrainType) -> &'static str {
         TerrainType::DeepOcean => "Deep Ocean",
         TerrainType::Ocean => "Ocean",
         TerrainType::Coast => "Coast",
+        TerrainType::Freshwater => "Freshwater",
         TerrainType::Beach => "Beach",
         TerrainType::Hills => "Hills",
         TerrainType::Mountain => "Mountain",

@@ -273,11 +273,12 @@ fn find_best_start(
     for tile in tiles {
         let c = tile.coord;
 
-        // Must be settleable terrain (Coast is shallow water now, not land).
+        // Must be settleable terrain. All water tiles (ocean depth tiers and
+        // inland Freshwater) and impassable peaks are skipped.
         match tile.terrain {
             TerrainType::DeepOcean | TerrainType::Ocean | TerrainType::Coast
-            | TerrainType::Mountain | TerrainType::SnowPeak | TerrainType::AridPeak
-            | TerrainType::GlacialPeak => continue,
+            | TerrainType::Freshwater | TerrainType::Mountain | TerrainType::SnowPeak
+            | TerrainType::AridPeak | TerrainType::GlacialPeak => continue,
             _ => {}
         }
 
@@ -329,8 +330,8 @@ fn find_best_start(
     best.map(|(c, _)| c)
 }
 
-/// Whether a scout can enter this terrain. Coast is shallow water, not land,
-/// so it is intentionally excluded.
+/// Whether a scout can enter this terrain. Coast and Freshwater are water (one
+/// ocean-side, one inland lake), so both are intentionally excluded.
 pub fn is_walkable(terrain: TerrainType) -> bool {
     matches!(
         terrain,
@@ -359,6 +360,7 @@ pub fn terrain_yields(terrain: TerrainType) -> Yields {
     match terrain {
         TerrainType::DeepOcean | TerrainType::Ocean => Yields::default(),
         TerrainType::Coast => Yields { food: 1, production: 0, gold: 2 },
+        TerrainType::Freshwater => Yields { food: 2, production: 0, gold: 1 },
         TerrainType::Beach => Yields { food: 1, production: 0, gold: 1 },
         TerrainType::Ashplain => Yields { food: 1, production: 0, gold: 0 },
         TerrainType::Thornveld => Yields { food: 1, production: 0, gold: 0 },

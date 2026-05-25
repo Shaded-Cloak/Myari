@@ -10,11 +10,13 @@
 //! zone / forest sampling positions. Three presets are assigned across the
 //! three islands as a permutation, so no two islands share a preset.
 
-use std::collections::HashMap;
+use std::collections::VecDeque;
 
 use fastnoise_lite::{DomainWarpType, FastNoiseLite, FractalType, NoiseType};
 use glam::Vec2;
 use hexx::{Hex, HexLayout, HexOrientation};
+use rayon::prelude::*;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::hexgrid::HexCoord;
 use crate::map::TerrainType;
@@ -68,24 +70,32 @@ const PRESETS: [Personality; 3] = [
         zone_phase: (0.0, 0.0),
         forest_phase: (0.0, 0.0),
     },
-    // B — Cooler-Wetter
+    // B — Cooler-Wetter (slightly more forest)
     Personality {
         heat_bias: -0.06,
-        forest_target: 0.24,
+        forest_target: 0.235,
         zone_phase: (137.0, -61.0),
         forest_phase: (-93.0, 211.0),
     },
-    // C — Warmer-Drier
+    // C — Warmer-Drier (slightly less forest)
     Personality {
         heat_bias: 0.06,
-        forest_target: 0.20,
+        forest_target: 0.205,
         zone_phase: (-204.0, 145.0),
         forest_phase: (79.0, -188.0),
     },
 ];
 
-const MOUNTAIN_UPPER_TARGET: f32 = 0.04;
-const MOUNTAIN_LOWER_TARGET: f32 = 0.18;
+/// Pre-dilation. The post-pass adds one ring of StonySlope around every kept
+/// mountain core, so effective coverage roughly doubles after cleanup.
+const MOUNTAIN_UPPER_TARGET: f32 = 0.010;
+const MOUNTAIN_LOWER_TARGET: f32 = 0.05;
+
+/// Minimum number of tiles a forest patch must have to survive cleanup.
+/// Anything smaller gets reverted to its natural base biome — kills the 1-5
+/// tile speckle the noise threshold occasionally produces without touching
+/// any real forest.
+const MIN_FOREST_PATCH_SIZE: usize = 6;
 
 const PERMUTATIONS: [[usize; 3]; 6] = [
     [0, 1, 2],
@@ -225,10 +235,14 @@ fn coast_penalty(inland: i32) -> f32 {
     }
 }
 
-/// Mountain "elevation score": blend of broad-mass elevation and ridge-fractal,
-/// plus a small wobble to break the iso-contour. Higher = mountain-likely.
+/// Mountain "elevation score": ridge fractal still dominates so mountains
+/// form along branching ridge lines, but the broad-mass `elevation_low` term
+/// is larger now so the score has a wider "shoulder" around each ridge peak
+/// — that's what gives StonySlope flanks visible thickness instead of a
+/// single-tile-wide spine. Wobble breaks the iso-contour so range edges
+/// stay ragged.
 fn mountain_score(fields: &Fields) -> f32 {
-    fields.elevation_low * 0.55 + fields.elevation_ridge * 0.45 + fields.wobble * 0.05
+    fields.elevation_ridge * 0.55 + fields.elevation_low * 0.45 + fields.wobble * 0.05
 }
 
 /// Forest score: higher moisture and lower elevation favour forest, with a
@@ -256,14 +270,12 @@ fn percentile_top(scores: &[f32], top_frac: f32) -> f32 {
 }
 
 fn upper_mountain(_fields: &Fields, _p: &Personality) -> TerrainType {
-    // AridPeak intentionally disabled — every upper-tier mountain is SnowPeak
-    // until we re-enable the warm-climate variant.
+    // Upper-tier mountains are always SnowPeak — AridPeak stays disabled.
     TerrainType::SnowPeak
 }
 
 fn lower_mountain(_fields: &Fields) -> TerrainType {
-    // Hills intentionally disabled — every lower-tier mountain is StonySlope
-    // until we re-enable the gentler variant.
+    // Lower-tier mountains are always StonySlope — Hills stays disabled.
     TerrainType::StonySlope
 }
 
@@ -315,7 +327,7 @@ struct FieldStats {
     ridge_std: f32,
 }
 
-fn compute_stats(raw: &[(HexCoord, Fields)]) -> FieldStats {
+fn compute_stats_from_raw(raw: &[(HexCoord, Fields, i32)]) -> FieldStats {
     let n = raw.len().max(1) as f32;
     let mut m_sum = 0.0;
     let mut m_sq = 0.0;
@@ -327,7 +339,7 @@ fn compute_stats(raw: &[(HexCoord, Fields)]) -> FieldStats {
     let mut z_sq = 0.0;
     let mut r_sum = 0.0;
     let mut r_sq = 0.0;
-    for (_, f) in raw {
+    for (_, f, _) in raw {
         m_sum += f.moisture;
         m_sq += f.moisture * f.moisture;
         e_sum += f.elevation_low;
@@ -390,10 +402,12 @@ fn normalize(fields: Fields, stats: &FieldStats) -> Fields {
 /// distinct per island.
 pub fn classify_all(
     world_seed: u64,
-    islands: &[(u8, Vec<HexCoord>, HashMap<HexCoord, i32>)],
-) -> HashMap<HexCoord, TerrainType> {
+    islands: &[(u8, Vec<HexCoord>, FxHashMap<HexCoord, i32>)],
+) -> FxHashMap<HexCoord, TerrainType> {
     let personalities = assign_personalities(world_seed);
-    let mut out = HashMap::new();
+    let total_land: usize = islands.iter().map(|(_, l, _)| l.len()).sum();
+    let mut out: FxHashMap<HexCoord, TerrainType> =
+        FxHashMap::with_capacity_and_hasher(total_land, Default::default());
 
     for (island_id, land, inland) in islands {
         let id = *island_id as usize;
@@ -404,8 +418,10 @@ pub fn classify_all(
         let noise = IslandNoise::for_island(world_seed, *island_id);
 
         // Pass 1: sample raw fields and inland distance for each tile.
+        // Parallel because each tile only reads the shared (immutable) noise
+        // context — this is the largest single hotspot in the generator.
         let raw: Vec<(HexCoord, Fields, i32)> = land
-            .iter()
+            .par_iter()
             .map(|&coord| {
                 let (lx, ly) = local_frame(coord, *island_id);
                 let f = noise.sample(lx, ly, &p);
@@ -418,14 +434,15 @@ pub fn classify_all(
         // Normalization mostly serves to keep the SCORE numerics consistent
         // across islands; the actual budget balance is delivered by percentile
         // thresholding below.
-        let stats =
-            compute_stats(&raw.iter().map(|(c, f, _)| (*c, *f)).collect::<Vec<_>>());
+        let stats = compute_stats_from_raw(&raw);
         let normalized: Vec<(HexCoord, Fields, i32)> = raw
-            .into_iter()
+            .into_par_iter()
             .map(|(c, f, d)| (c, normalize(f, &stats), d))
             .collect();
 
         // Pass 3: per-island percentile thresholds for mountain and forest.
+        // The forest pool excludes tiles that will end up as mountain so its
+        // percentile threshold matches the actual non-mountain land area.
         let mtn_scores: Vec<f32> = normalized
             .iter()
             .filter(|(_, _, d)| *d >= MOUNTAIN_MIN_INLAND)
@@ -446,25 +463,302 @@ pub fn classify_all(
 
         // Pass 4: classify each tile with the per-island thresholds. The
         // wobble term on the score itself (not on the threshold here) is what
-        // keeps the iso-contour ragged.
-        for (coord, fields, d) in normalized {
-            let terrain = if d >= MOUNTAIN_MIN_INLAND {
-                let m = mountain_score(&fields);
+        // keeps the iso-contour ragged. Lower-tier mountains are always
+        // StonySlope and upper-tier are always SnowPeak — no Hills/AridPeak
+        // variants for now.
+        for (coord, fields, d) in &normalized {
+            let terrain = if *d >= MOUNTAIN_MIN_INLAND {
+                let m = mountain_score(fields);
                 if m > mtn_upper_thresh {
-                    upper_mountain(&fields, &p)
+                    upper_mountain(fields, &p)
                 } else if m > mtn_lower_thresh {
-                    lower_mountain(&fields)
+                    lower_mountain(fields)
                 } else {
-                    classify_non_mountain(&fields, d, forest_thresh, &p)
+                    classify_non_mountain(fields, *d, forest_thresh, &p)
                 }
             } else {
-                classify_non_mountain(&fields, d, forest_thresh, &p)
+                classify_non_mountain(fields, *d, forest_thresh, &p)
             };
-            out.insert(coord, terrain);
+            out.insert(*coord, terrain);
         }
+
+        // Pass 5: collapse each connected forest patch to its modal type so a
+        // single patch never shows two forest tile types at once. The noise
+        // still decides where forests go and where their type boundaries sit;
+        // this only smooths the boundary inside each patch.
+        unify_forest_patches(land, &mut out);
+
+        // Pass 6: drop forest patches below `MIN_FOREST_PATCH_SIZE` back to
+        // their natural base biome (Plains / Greenfield). The forest noise +
+        // threshold occasionally produces 1-5 tile speckle that reads as
+        // accidental rather than designed; this pass removes only those.
+        drop_small_forest_patches(land, &mut out, &normalized, &p);
+
+        // Pass 7: mountain cleanup.
+        //  - Drop any connected mountain component that has no SnowPeak (no
+        //    standalone StonySlope ranges leading nowhere).
+        //  - Dilate the surviving cores by one hex of StonySlope, which both
+        //    thickens the bases and guarantees every SnowPeak is ringed by
+        //    StonySlope on all sides.
+        cleanup_mountains(land, &mut out, &normalized, &p);
     }
 
     out
+}
+
+fn is_forest(t: TerrainType) -> bool {
+    matches!(
+        t,
+        TerrainType::Oldwood | TerrainType::Darkpine | TerrainType::Deepjungle
+    )
+}
+
+/// Find each connected forest component within `land` (any of the three forest
+/// tile types counts as one group) and replace all its tiles with the modal
+/// type for that component. Ties break deterministically by enum order.
+fn unify_forest_patches(land: &[HexCoord], terrains: &mut FxHashMap<HexCoord, TerrainType>) {
+    let mut land_set: FxHashSet<HexCoord> =
+        FxHashSet::with_capacity_and_hasher(land.len(), Default::default());
+    for &c in land {
+        land_set.insert(c);
+    }
+    let mut visited: FxHashSet<HexCoord> =
+        FxHashSet::with_capacity_and_hasher(land.len(), Default::default());
+
+    let mut starts: Vec<HexCoord> = land.to_vec();
+    starts.sort_by_key(|c| (c.q, c.r));
+
+    for start in starts {
+        if visited.contains(&start) {
+            continue;
+        }
+        let Some(&t0) = terrains.get(&start) else {
+            continue;
+        };
+        if !is_forest(t0) {
+            continue;
+        }
+
+        let mut component: Vec<HexCoord> = Vec::new();
+        let mut counts: FxHashMap<TerrainType, usize> =
+            FxHashMap::with_capacity_and_hasher(4, Default::default());
+        let mut queue: VecDeque<HexCoord> = VecDeque::from([start]);
+        visited.insert(start);
+
+        while let Some(c) = queue.pop_front() {
+            let Some(&t) = terrains.get(&c) else {
+                continue;
+            };
+            component.push(c);
+            *counts.entry(t).or_default() += 1;
+            for n in c.neighbors() {
+                if !land_set.contains(&n) || visited.contains(&n) {
+                    continue;
+                }
+                let Some(&nt) = terrains.get(&n) else {
+                    continue;
+                };
+                if !is_forest(nt) {
+                    continue;
+                }
+                visited.insert(n);
+                queue.push_back(n);
+            }
+        }
+
+        let modal = counts
+            .into_iter()
+            .max_by(|a, b| a.1.cmp(&b.1).then_with(|| (a.0 as u8).cmp(&(b.0 as u8))))
+            .map(|(t, _)| t);
+        if let Some(modal) = modal {
+            for c in component {
+                terrains.insert(c, modal);
+            }
+        }
+    }
+}
+
+/// Walk each connected forest patch; any patch smaller than
+/// `MIN_FOREST_PATCH_SIZE` is reverted tile-by-tile to its natural base biome
+/// (same `base_biome` call the original classifier would have made). This
+/// removes the occasional 1-5 tile speckle without changing where real
+/// forests sit or what type they are.
+fn drop_small_forest_patches(
+    land: &[HexCoord],
+    terrains: &mut FxHashMap<HexCoord, TerrainType>,
+    normalized: &[(HexCoord, Fields, i32)],
+    p: &Personality,
+) {
+    let mut land_set: FxHashSet<HexCoord> =
+        FxHashSet::with_capacity_and_hasher(land.len(), Default::default());
+    for &c in land {
+        land_set.insert(c);
+    }
+    let mut field_by_coord: FxHashMap<HexCoord, Fields> =
+        FxHashMap::with_capacity_and_hasher(normalized.len(), Default::default());
+    for (c, f, _) in normalized {
+        field_by_coord.insert(*c, *f);
+    }
+    let mut visited: FxHashSet<HexCoord> =
+        FxHashSet::with_capacity_and_hasher(land.len(), Default::default());
+
+    let mut starts: Vec<HexCoord> = land.to_vec();
+    starts.sort_by_key(|c| (c.q, c.r));
+
+    for start in starts {
+        if visited.contains(&start) {
+            continue;
+        }
+        let Some(&t0) = terrains.get(&start) else {
+            continue;
+        };
+        if !is_forest(t0) {
+            continue;
+        }
+
+        let mut component: Vec<HexCoord> = Vec::new();
+        let mut queue: VecDeque<HexCoord> = VecDeque::from([start]);
+        visited.insert(start);
+
+        while let Some(c) = queue.pop_front() {
+            component.push(c);
+            for n in c.neighbors() {
+                if !land_set.contains(&n) || visited.contains(&n) {
+                    continue;
+                }
+                let Some(&nt) = terrains.get(&n) else {
+                    continue;
+                };
+                if !is_forest(nt) {
+                    continue;
+                }
+                visited.insert(n);
+                queue.push_back(n);
+            }
+        }
+
+        if component.len() < MIN_FOREST_PATCH_SIZE {
+            for c in component {
+                if let Some(fields) = field_by_coord.get(&c) {
+                    terrains.insert(c, base_biome(fields, p));
+                }
+            }
+        }
+    }
+}
+
+fn is_mountain(t: TerrainType) -> bool {
+    matches!(t, TerrainType::StonySlope | TerrainType::SnowPeak)
+}
+
+/// Post-process mountains:
+///   1. Walk each connected mountain component (StonySlope + SnowPeak grouped
+///      together). Any component that contains zero SnowPeak tiles is reverted
+///      to base biome — no "orphan" ranges that don't lead to a peak.
+///   2. For each surviving mountain tile, convert non-mountain land neighbours
+///      to StonySlope. That dilates the bases by one ring so they read as
+///      proper mountain mass instead of single-tile spines, and guarantees
+///      every SnowPeak ends up surrounded by StonySlope on all six sides.
+///      Beach and Freshwater are protected from the dilation.
+fn cleanup_mountains(
+    land: &[HexCoord],
+    terrains: &mut FxHashMap<HexCoord, TerrainType>,
+    normalized: &[(HexCoord, Fields, i32)],
+    p: &Personality,
+) {
+    let mut land_set: FxHashSet<HexCoord> =
+        FxHashSet::with_capacity_and_hasher(land.len(), Default::default());
+    for &c in land {
+        land_set.insert(c);
+    }
+    let mut field_by_coord: FxHashMap<HexCoord, Fields> =
+        FxHashMap::with_capacity_and_hasher(normalized.len(), Default::default());
+    for (c, f, _) in normalized {
+        field_by_coord.insert(*c, *f);
+    }
+
+    // Step 1: find connected mountain components, drop orphans.
+    let mut visited: FxHashSet<HexCoord> =
+        FxHashSet::with_capacity_and_hasher(land.len(), Default::default());
+    let mut kept: FxHashSet<HexCoord> =
+        FxHashSet::with_capacity_and_hasher(land.len() / 8, Default::default());
+
+    let mut starts: Vec<HexCoord> = land.to_vec();
+    starts.sort_by_key(|c| (c.q, c.r));
+
+    for start in starts {
+        if visited.contains(&start) {
+            continue;
+        }
+        let Some(&t0) = terrains.get(&start) else {
+            continue;
+        };
+        if !is_mountain(t0) {
+            continue;
+        }
+
+        let mut component: Vec<HexCoord> = Vec::new();
+        let mut has_peak = false;
+        let mut queue: VecDeque<HexCoord> = VecDeque::from([start]);
+        visited.insert(start);
+
+        while let Some(c) = queue.pop_front() {
+            let Some(&t) = terrains.get(&c) else {
+                continue;
+            };
+            component.push(c);
+            if t == TerrainType::SnowPeak {
+                has_peak = true;
+            }
+            for n in c.neighbors() {
+                if !land_set.contains(&n) || visited.contains(&n) {
+                    continue;
+                }
+                let Some(&nt) = terrains.get(&n) else {
+                    continue;
+                };
+                if !is_mountain(nt) {
+                    continue;
+                }
+                visited.insert(n);
+                queue.push_back(n);
+            }
+        }
+
+        if has_peak {
+            for c in &component {
+                kept.insert(*c);
+            }
+        } else {
+            for c in component {
+                if let Some(fields) = field_by_coord.get(&c) {
+                    terrains.insert(c, base_biome(fields, p));
+                }
+            }
+        }
+    }
+
+    // Step 2: dilate kept mountain cores by one ring of StonySlope. Beach and
+    // freshwater are off-limits — those are deliberate edges of the land.
+    let mut to_thicken: FxHashSet<HexCoord> =
+        FxHashSet::with_capacity_and_hasher(kept.len(), Default::default());
+    for &c in &kept {
+        for n in c.neighbors() {
+            if !land_set.contains(&n) || kept.contains(&n) {
+                continue;
+            }
+            let Some(&nt) = terrains.get(&n) else {
+                continue;
+            };
+            if matches!(nt, TerrainType::Beach | TerrainType::Freshwater) {
+                continue;
+            }
+            to_thicken.insert(n);
+        }
+    }
+    for c in to_thicken {
+        terrains.insert(c, TerrainType::StonySlope);
+    }
 }
 
 fn classify_non_mountain(
@@ -490,7 +784,7 @@ mod tests {
             let ps = assign_personalities(seed);
             let mut biases: Vec<i32> = ps
                 .iter()
-                .map(|p| ((p.heat_bias * 1000.0).round() as i32))
+                .map(|p| (p.heat_bias * 1000.0).round() as i32)
                 .collect();
             biases.sort();
             assert_eq!(biases, vec![-60, 0, 60], "seed {seed}: each preset must appear exactly once");

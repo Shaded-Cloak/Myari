@@ -1,19 +1,21 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 
 use glam::Vec2;
+use rayon::prelude::*;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::hexgrid::{hex_disk, HexCoord};
-use crate::rng::tile_roll;
+use crate::rng::{hash_seed, tile_roll};
 use fastnoise_lite::{DomainWarpType, FastNoiseLite, FractalType, NoiseType};
 use hexx::{HexLayout, HexOrientation};
 use serde::{Deserialize, Serialize};
 
-pub const MAP_RADIUS: i32 = 220;
+pub const MAP_RADIUS: i32 = 280;
 
 // Island layout constants (layout-space units ≈ hex widths)
-const CENTER_R: f32 = 66.0;
-const CRESCENT_R_IN: f32 = 96.0;
-const CRESCENT_R_OUT: f32 = 192.0;
+const CENTER_R: f32 = 70.0;
+const CRESCENT_R_IN: f32 = 140.0;
+const CRESCENT_R_OUT: f32 = 240.0;
 const CRESCENT_ARC_HALF: f32 = 44.0; // 88° arc → 32° open ocean between each pair
 const COAST_NOISE_AMP: f32 = 14.0;
 /// Per-tile wobble (in degrees) applied to the arc half-width so the crescent
@@ -24,6 +26,21 @@ const ARC_WOBBLE_AMP_DEG: f32 = 7.0;
 const COAST_MAX_DIST: i32 = 1;
 const DEEP_OCEAN_MIN_DIST: i32 = 6;
 
+/// Minimum BFS distance from the coast at which a tile can become an inland
+/// lake. Lower values would let lakes spawn right behind the beach, blending
+/// into the shore.
+const LAKE_MIN_INLAND: i32 = 3;
+/// Fraction of inland-eligible tiles that become Freshwater per island. Tuned
+/// alongside `LAKE_NOISE_FREQ` so each crescent ends up with exactly one big
+/// lake of ~1000-1200 hexes instead of two smaller ones.
+const LAKE_TARGET_FRAC: f32 = 0.07;
+/// Lake noise frequency. A period of ~90 hexes is comfortably wider than the
+/// crescent's footprint, so the noise has only one strong maximum per island
+/// — that locks each crescent to a single connected lake which absorbs the
+/// full per-island water budget. Higher octaves in the FBM still give the
+/// shoreline organic wobble.
+const LAKE_NOISE_FREQ: f32 = 0.011;
+
 const CRESCENT_ANGLES: [f32; 3] = [90.0, 210.0, 330.0];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -31,6 +48,10 @@ pub enum TerrainType {
     DeepOcean,
     Ocean,
     Coast,
+    /// Inland lake water — on an outer-island land tile but counted as water
+    /// for the beach fringe pass. Does NOT participate in the Coast / Ocean /
+    /// DeepOcean depth gradient.
+    Freshwater,
     Beach,
     Hills,
     Mountain,
@@ -90,7 +111,7 @@ pub struct HexTile {
 pub struct Map {
     pub tiles: Vec<HexTile>,
     #[serde(skip)]
-    by_coord: HashMap<HexCoord, usize>,
+    by_coord: FxHashMap<HexCoord, usize>,
 }
 
 impl Map {
@@ -102,13 +123,15 @@ impl Map {
 
     fn rebuild_index(&mut self) {
         self.by_coord.clear();
+        self.by_coord.reserve(self.tiles.len());
         for (i, t) in self.tiles.iter().enumerate() {
             self.by_coord.insert(t.coord, i);
         }
     }
 
     pub fn from_tiles(tiles: Vec<HexTile>) -> Self {
-        let mut by_coord = HashMap::with_capacity(tiles.len());
+        let mut by_coord: FxHashMap<HexCoord, usize> =
+            FxHashMap::with_capacity_and_hasher(tiles.len(), Default::default());
         for (i, t) in tiles.iter().enumerate() {
             by_coord.insert(t.coord, i);
         }
@@ -122,11 +145,58 @@ impl Map {
     }
 }
 
+/// Dense `(q, r) -> tile index` table. Replaces `HashMap<HexCoord, usize>`
+/// during generation for O(1) lookup with no hashing. The disk has radius
+/// `MAP_RADIUS`, so q and r each live in `[-radius, radius]` — we allocate a
+/// `(2R+1)^2` flat `Vec<i32>` where `-1` marks an out-of-disk slot. Memory cost
+/// is ~780 KB for radius 220 (one i32 per slot), trivial next to the perf win.
+struct TileIndex {
+    radius: i32,
+    stride: i32,
+    indices: Vec<i32>,
+}
+
+impl TileIndex {
+    fn new(radius: i32, tiles: &[TileGen]) -> Self {
+        let stride = 2 * radius + 1;
+        let mut indices = vec![-1i32; (stride * stride) as usize];
+        for (i, t) in tiles.iter().enumerate() {
+            let key = ((t.coord.q + radius) * stride + (t.coord.r + radius)) as usize;
+            indices[key] = i as i32;
+        }
+        Self {
+            radius,
+            stride,
+            indices,
+        }
+    }
+
+    #[inline]
+    fn get(&self, c: HexCoord) -> Option<usize> {
+        if c.q < -self.radius || c.q > self.radius || c.r < -self.radius || c.r > self.radius {
+            return None;
+        }
+        let key = ((c.q + self.radius) * self.stride + (c.r + self.radius)) as usize;
+        let idx = self.indices[key];
+        if idx < 0 {
+            None
+        } else {
+            Some(idx as usize)
+        }
+    }
+}
+
 fn generate_tiles(radius: i32, seed: u64) -> Vec<HexTile> {
+    let total_start = std::time::Instant::now();
+
     let noise = NoiseCtx::new(seed);
     let coords = hex_disk(radius);
+
+    // Parallel initial classify — each tile is independent of every other and
+    // only reads the shared (immutable) noise context.
+    let classify_start = std::time::Instant::now();
     let mut gen: Vec<TileGen> = coords
-        .iter()
+        .par_iter()
         .map(|&coord| {
             let island = classify_island(&noise, coord.q, coord.r);
             let terrain = if island.is_some() {
@@ -141,17 +211,35 @@ fn generate_tiles(radius: i32, seed: u64) -> Vec<HexTile> {
             }
         })
         .collect();
+    let classify_ms = classify_start.elapsed().as_secs_f32() * 1000.0;
 
-    let by_coord: HashMap<HexCoord, usize> = gen
-        .iter()
-        .enumerate()
-        .map(|(i, t)| (t.coord, i))
-        .collect();
+    let index_start = std::time::Instant::now();
+    let by_coord = TileIndex::new(radius, &gen);
+    let index_ms = index_start.elapsed().as_secs_f32() * 1000.0;
 
+    let holes_start = std::time::Instant::now();
+    fix_inland_holes(&mut gen, &by_coord);
+    let holes_ms = holes_start.elapsed().as_secs_f32() * 1000.0;
+
+    let lakes_start = std::time::Instant::now();
+    assign_lakes(&mut gen, seed, &by_coord);
+    let lakes_ms = lakes_start.elapsed().as_secs_f32() * 1000.0;
+
+    let beach_start = std::time::Instant::now();
     assign_beaches(&mut gen, seed, &by_coord);
+    let beach_ms = beach_start.elapsed().as_secs_f32() * 1000.0;
+
+    let outer_start = std::time::Instant::now();
     assign_outer_island_terrain(&mut gen, seed, &by_coord);
+    let outer_ms = outer_start.elapsed().as_secs_f32() * 1000.0;
+
+    let depth_start = std::time::Instant::now();
     assign_water_depth(&mut gen, &by_coord);
+    let depth_ms = depth_start.elapsed().as_secs_f32() * 1000.0;
+
+    let cleanup_start = std::time::Instant::now();
     speckle_cleanup(&mut gen, &by_coord);
+    let cleanup_ms = cleanup_start.elapsed().as_secs_f32() * 1000.0;
 
     let tiles: Vec<HexTile> = gen
         .into_iter()
@@ -160,6 +248,11 @@ fn generate_tiles(radius: i32, seed: u64) -> Vec<HexTile> {
             terrain: t.terrain,
         })
         .collect();
+
+    let total_ms = total_start.elapsed().as_secs_f32() * 1000.0;
+    println!(
+        "=== Generation timing (ms) === total={total_ms:.1} | mask={classify_ms:.1} index={index_ms:.1} holes={holes_ms:.1} lakes={lakes_ms:.1} beach={beach_ms:.1} outer={outer_ms:.1} depth={depth_ms:.1} cleanup={cleanup_ms:.1}",
+    );
 
     log_distribution(&tiles);
     tiles
@@ -228,9 +321,18 @@ fn flat_layout(hex_size: f32) -> HexLayout {
     }
 }
 
+// Layout-space conversions in the noise-classification path use unit-size hexes
+// and are called per-tile, so we keep a single shared instance instead of
+// rebuilding the layout struct each call.
+thread_local! {
+    static UNIT_LAYOUT: HexLayout = flat_layout(1.0);
+}
+
 fn layout_xy(q: i32, r: i32) -> Vec2 {
-    let p = flat_layout(1.0).hex_to_world_pos(hexx::Hex::new(q, r));
-    Vec2::new(p.x, p.y)
+    UNIT_LAYOUT.with(|layout| {
+        let p = layout.hex_to_world_pos(hexx::Hex::new(q, r));
+        Vec2::new(p.x, p.y)
+    })
 }
 
 fn polar(v: Vec2) -> (f32, f32) {
@@ -276,61 +378,243 @@ fn classify_island(noise: &NoiseCtx, q: i32, r: i32) -> Option<Island> {
     None
 }
 
+// ── Inland-hole cleanup ──────────────────────────────────────────────────────
+
+/// Fix water tiles that the wobbly coast mask accidentally stranded *inside*
+/// an island. We flood-fill from the map's outer edge through every water
+/// tile; any water tile not reachable from the edge is a hole. Each hole tile
+/// is promoted to whichever crescent's land surrounds it most, then the rest
+/// of the pipeline classifies it like any other land tile.
+fn fix_inland_holes(gen: &mut [TileGen], by_coord: &TileIndex) {
+    let n = gen.len();
+    let mut reachable: Vec<bool> = vec![false; n];
+    let mut queue: VecDeque<usize> = VecDeque::with_capacity(n / 8);
+
+    // Seed BFS from every water tile that has an off-map neighbour. Those are
+    // by definition tiles at the outer rim, i.e. the real open ocean.
+    for (i, tile) in gen.iter().enumerate() {
+        if tile.island.is_some() {
+            continue;
+        }
+        let touches_edge = tile
+            .coord
+            .neighbors()
+            .iter()
+            .any(|n| by_coord.get(*n).is_none());
+        if touches_edge {
+            reachable[i] = true;
+            queue.push_back(i);
+        }
+    }
+
+    while let Some(idx) = queue.pop_front() {
+        let coord = gen[idx].coord;
+        for n_coord in coord.neighbors() {
+            let Some(nidx) = by_coord.get(n_coord) else {
+                continue;
+            };
+            if reachable[nidx] || gen[nidx].island.is_some() {
+                continue;
+            }
+            reachable[nidx] = true;
+            queue.push_back(nidx);
+        }
+    }
+
+    // Promote any unreachable water tile to land of the surrounding crescent.
+    for i in 0..n {
+        if gen[i].island.is_some() || reachable[i] {
+            continue;
+        }
+        let mut crescent_count = [0u32; 3];
+        let mut center_count = 0u32;
+        for n in gen[i].coord.neighbors() {
+            if let Some(nidx) = by_coord.get(n) {
+                match gen[nidx].island {
+                    Some(Island::Crescent(c)) => crescent_count[c as usize] += 1,
+                    Some(Island::Center) => center_count += 1,
+                    None => {}
+                }
+            }
+        }
+        let max_crescent = crescent_count.iter().copied().max().unwrap_or(0);
+        let promoted = if max_crescent >= center_count {
+            let idx = crescent_count
+                .iter()
+                .position(|&c| c == max_crescent)
+                .unwrap_or(0);
+            Island::Crescent(idx as u8)
+        } else {
+            Island::Center
+        };
+        gen[i].island = Some(promoted);
+        gen[i].terrain = TerrainType::Plains;
+    }
+}
+
+// ── Inland lakes ─────────────────────────────────────────────────────────────
+
+/// Drop a handful of small Freshwater patches into each outer (crescent)
+/// island. Runs BEFORE `assign_beaches` so the beach pass naturally wraps
+/// every lake with a sandy fringe.
+///
+/// Algorithm: per island, sample a high-frequency FBM seeded uniquely for
+/// (world_seed, island_id). Tiles at `inland >= LAKE_MIN_INLAND` are eligible.
+/// We then take the top `LAKE_TARGET_FRAC` of eligible tiles by noise score —
+/// percentile, so coverage is constant across islands regardless of how the
+/// noise distribution shifts. A final pass drops any 1-tile lake (isolated
+/// Freshwater with no Freshwater neighbour) back to Plains.
+fn assign_lakes(gen: &mut [TileGen], seed: u64, by_coord: &TileIndex) {
+    for island_id in 0..3u8 {
+        let land: Vec<HexCoord> = gen
+            .iter()
+            .filter(|t| t.island == Some(Island::Crescent(island_id)))
+            .map(|t| t.coord)
+            .collect();
+        if land.is_empty() {
+            continue;
+        }
+
+        let inland = inland_distances(&land);
+        let lake_seed = hash_seed(seed, island_id as u32, 0x1A_4E, 0xF0);
+        let noise = make_fbm(lake_seed, 0, 3, LAKE_NOISE_FREQ);
+
+        // Sample inland-eligible tiles in parallel — pure read of the shared
+        // (immutable) noise context.
+        let eligible: Vec<(HexCoord, f32)> = land
+            .par_iter()
+            .filter(|c| inland.get(c).copied().unwrap_or(0) >= LAKE_MIN_INLAND)
+            .map(|&c| {
+                let p = layout_xy(c.q, c.r);
+                (c, noise.get_noise_2d(p.x, p.y))
+            })
+            .collect();
+        if eligible.is_empty() {
+            continue;
+        }
+
+        // Percentile threshold — top LAKE_TARGET_FRAC of scores become lakes.
+        let mut scores: Vec<f32> = eligible.iter().map(|(_, s)| *s).collect();
+        scores.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+        let cutoff_idx = ((scores.len() as f32 * LAKE_TARGET_FRAC) as usize)
+            .min(scores.len().saturating_sub(1));
+        let threshold = scores[cutoff_idx];
+
+        for (coord, score) in eligible {
+            if score >= threshold {
+                if let Some(idx) = by_coord.get(coord) {
+                    gen[idx].terrain = TerrainType::Freshwater;
+                }
+            }
+        }
+    }
+
+    // Drop 1-tile lakes — they read as speckle, not as a lake. Revert them to
+    // Plains so the outer-island classifier picks something natural for the
+    // tile.
+    let mut to_revert: Vec<usize> = Vec::new();
+    for (i, tile) in gen.iter().enumerate() {
+        if tile.terrain != TerrainType::Freshwater {
+            continue;
+        }
+        let has_neighbour_lake = tile.coord.neighbors().iter().any(|n| {
+            by_coord
+                .get(*n)
+                .map(|idx| gen[idx].terrain == TerrainType::Freshwater)
+                .unwrap_or(false)
+        });
+        if !has_neighbour_lake {
+            to_revert.push(i);
+        }
+    }
+    for idx in to_revert {
+        gen[idx].terrain = TerrainType::Plains;
+    }
+}
+
 // ── Beach fringe ─────────────────────────────────────────────────────────────
 
 fn is_water(t: TerrainType) -> bool {
     matches!(
         t,
-        TerrainType::DeepOcean | TerrainType::Ocean | TerrainType::Coast
+        TerrainType::DeepOcean
+            | TerrainType::Ocean
+            | TerrainType::Coast
+            | TerrainType::Freshwater
     )
 }
 
-fn assign_beaches(gen: &mut [TileGen], seed: u64, by_coord: &HashMap<HexCoord, usize>) {
-    let water_coords: HashMap<HexCoord, ()> = gen
-        .iter()
-        .filter(|t| is_water(t.terrain))
-        .map(|t| (t.coord, ()))
-        .collect();
+fn assign_beaches(gen: &mut [TileGen], seed: u64, by_coord: &TileIndex) {
+    // Compact water mask is faster than a hash set for the inner `any` check.
+    let mut is_water_tile: Vec<bool> = vec![false; gen.len()];
+    for (i, t) in gen.iter().enumerate() {
+        is_water_tile[i] = is_water(t.terrain);
+    }
 
     // Pass 1: every land tile touching water becomes beach (the shoreline ring).
+    // Freshwater tiles are geographically on an island but have water terrain,
+    // so we filter them out here — only "land terrain" tiles can become Beach.
     let fringe: Vec<HexCoord> = gen
         .iter()
-        .filter(|t| t.is_land())
+        .filter(|t| t.is_land() && !is_water(t.terrain))
         .filter(|t| {
-            t.coord
-                .neighbors()
-                .iter()
-                .any(|n| water_coords.contains_key(n))
+            t.coord.neighbors().iter().any(|n| {
+                by_coord
+                    .get(*n)
+                    .map(|idx| is_water_tile[idx])
+                    .unwrap_or(false)
+            })
         })
         .map(|t| t.coord)
         .collect();
 
-    let fringe_set: HashMap<HexCoord, ()> = fringe.iter().map(|&c| (c, ())).collect();
-
+    let mut is_fringe: Vec<bool> = vec![false; gen.len()];
     for coord in &fringe {
-        if let Some(&idx) = by_coord.get(coord) {
+        if let Some(idx) = by_coord.get(*coord) {
+            is_fringe[idx] = true;
             gen[idx].terrain = TerrainType::Beach;
         }
     }
 
-    // Pass 2: each fringe hex independently decides whether to extend one step
-    // inland. Per-tile rolls break the parallel-ring pattern.
+    // Pass 2: each ocean-adjacent fringe hex independently decides whether to
+    // extend one step inland. Per-tile rolls break the parallel-ring pattern.
+    // Lake-only fringe tiles (those bordering Freshwater but no ocean tile)
+    // are intentionally excluded so every lake stays ringed by exactly one
+    // tile of beach.
     const EXTEND_CHANCE: f32 = 0.46;
     let mut extensions: Vec<HexCoord> = Vec::new();
 
     for &coord in &fringe {
+        let touches_ocean = coord.neighbors().iter().any(|n| {
+            by_coord
+                .get(*n)
+                .map(|idx| {
+                    matches!(
+                        gen[idx].terrain,
+                        TerrainType::DeepOcean | TerrainType::Ocean | TerrainType::Coast
+                    )
+                })
+                .unwrap_or(false)
+        });
+        if !touches_ocean {
+            continue;
+        }
         if tile_roll(seed, coord.q, coord.r, 71) > EXTEND_CHANCE {
             continue;
         }
         for n in coord.neighbors() {
-            let Some(&idx) = by_coord.get(&n) else {
+            let Some(idx) = by_coord.get(n) else {
                 continue;
             };
             let inland = &gen[idx];
             if !inland.is_land() {
                 continue;
             }
-            if fringe_set.contains_key(&n) {
+            if is_fringe[idx] {
+                continue;
+            }
+            if is_water(inland.terrain) {
+                // Skip freshwater (it's "land" geographically but water in terrain).
                 continue;
             }
             if inland.terrain == TerrainType::Beach {
@@ -341,9 +625,41 @@ fn assign_beaches(gen: &mut [TileGen], seed: u64, by_coord: &HashMap<HexCoord, u
     }
 
     for coord in extensions {
-        if let Some(&idx) = by_coord.get(&coord) {
+        if let Some(idx) = by_coord.get(coord) {
             gen[idx].terrain = TerrainType::Beach;
         }
+    }
+
+    // Pass 3: fill in single-tile beach pockets. When pass 2 extends some
+    // fringe tiles but not others, the un-extended slot in ring 2 can end up
+    // surrounded by beach (or beach + water) on most sides. Those slots read
+    // as awkward inland green patches stuck between sand and ocean — convert
+    // any non-beach land tile with at least 4 beach (or water) neighbours
+    // into beach as well, smoothing the fringe.
+    let mut pocket_fills: Vec<usize> = Vec::new();
+    for (i, tile) in gen.iter().enumerate() {
+        if !tile.is_land() {
+            continue;
+        }
+        if tile.terrain == TerrainType::Beach || is_water(tile.terrain) {
+            continue;
+        }
+        let mut beachy_neighbors = 0;
+        for n in tile.coord.neighbors() {
+            let Some(idx) = by_coord.get(n) else {
+                continue;
+            };
+            let t = gen[idx].terrain;
+            if t == TerrainType::Beach || is_water(t) {
+                beachy_neighbors += 1;
+            }
+        }
+        if beachy_neighbors >= 4 {
+            pocket_fills.push(i);
+        }
+    }
+    for idx in pocket_fills {
+        gen[idx].terrain = TerrainType::Beach;
     }
 }
 
@@ -352,13 +668,18 @@ fn assign_beaches(gen: &mut [TileGen], seed: u64, by_coord: &HashMap<HexCoord, u
 /// BFS distance from the coastal edge of an island (tiles touching water or the
 /// outside of the land set are distance 0). Used as a feature gate (mountains
 /// need depth) and a soft suppressor for forests close to the shore.
-fn inland_distances(land: &[HexCoord]) -> HashMap<HexCoord, i32> {
-    let set: HashMap<HexCoord, ()> = land.iter().map(|&c| (c, ())).collect();
-    let mut dist: HashMap<HexCoord, i32> = HashMap::with_capacity(land.len());
-    let mut queue: VecDeque<HexCoord> = VecDeque::new();
+fn inland_distances(land: &[HexCoord]) -> FxHashMap<HexCoord, i32> {
+    let mut set: FxHashSet<HexCoord> =
+        FxHashSet::with_capacity_and_hasher(land.len(), Default::default());
+    for &c in land {
+        set.insert(c);
+    }
+    let mut dist: FxHashMap<HexCoord, i32> =
+        FxHashMap::with_capacity_and_hasher(land.len(), Default::default());
+    let mut queue: VecDeque<HexCoord> = VecDeque::with_capacity(land.len() / 4);
 
     for &c in land {
-        if c.neighbors().iter().any(|n| !set.contains_key(n)) {
+        if c.neighbors().iter().any(|n| !set.contains(n)) {
             dist.insert(c, 0);
             queue.push_back(c);
         }
@@ -367,7 +688,7 @@ fn inland_distances(land: &[HexCoord]) -> HashMap<HexCoord, i32> {
     while let Some(c) = queue.pop_front() {
         let d = dist[&c];
         for n in c.neighbors() {
-            if set.contains_key(&n) && !dist.contains_key(&n) {
+            if set.contains(&n) && !dist.contains_key(&n) {
                 dist.insert(n, d + 1);
                 queue.push_back(n);
             }
@@ -378,33 +699,43 @@ fn inland_distances(land: &[HexCoord]) -> HashMap<HexCoord, i32> {
 
 // ── Outer-island terrain ─────────────────────────────────────────────────────
 
-fn collect_outer_islands(gen: &[TileGen]) -> Vec<(u8, Vec<HexCoord>, HashMap<HexCoord, i32>)> {
-    let mut out: Vec<(u8, Vec<HexCoord>, HashMap<HexCoord, i32>)> = Vec::with_capacity(3);
-    for island_id in 0..3u8 {
-        let land: Vec<HexCoord> = gen
-            .iter()
-            .filter(|t| t.island == Some(Island::Crescent(island_id)))
-            .map(|t| t.coord)
-            .collect();
+fn collect_outer_islands(
+    gen: &[TileGen],
+) -> Vec<(u8, Vec<HexCoord>, FxHashMap<HexCoord, i32>)> {
+    let mut out: Vec<(u8, Vec<HexCoord>, FxHashMap<HexCoord, i32>)> = Vec::with_capacity(3);
+
+    // Single bucket-pass over `gen` partitions the three crescents at once.
+    // Freshwater (already-placed lakes) is excluded so the noise classifier
+    // operates on terra-firma tiles only — that keeps forest/mountain budgets
+    // matched whether or not an island has a lake.
+    let mut buckets: [Vec<HexCoord>; 3] = Default::default();
+    for t in gen {
+        if t.terrain == TerrainType::Freshwater {
+            continue;
+        }
+        if let Some(Island::Crescent(i)) = t.island {
+            buckets[i as usize].push(t.coord);
+        }
+    }
+    for (i, land) in buckets.into_iter().enumerate() {
         if land.is_empty() {
             continue;
         }
         let inland = inland_distances(&land);
-        out.push((island_id, land, inland));
+        out.push((i as u8, land, inland));
     }
     out
 }
 
-fn assign_outer_island_terrain(
-    gen: &mut [TileGen],
-    seed: u64,
-    by_coord: &HashMap<HexCoord, usize>,
-) {
+fn assign_outer_island_terrain(gen: &mut [TileGen], seed: u64, by_coord: &TileIndex) {
     let islands = collect_outer_islands(gen);
     let assignments = crate::outer_islands::classify_all(seed, &islands);
     for (coord, terrain) in assignments {
-        if let Some(&idx) = by_coord.get(&coord) {
-            if gen[idx].terrain == TerrainType::Beach {
+        if let Some(idx) = by_coord.get(coord) {
+            // Beach (shoreline ring + lake fringes) and Freshwater (lake water)
+            // are already in place — the noise-driven biome classifier never
+            // overwrites either.
+            if gen[idx].terrain == TerrainType::Beach || is_water(gen[idx].terrain) {
                 continue;
             }
             gen[idx].terrain = terrain;
@@ -414,45 +745,46 @@ fn assign_outer_island_terrain(
 
 // ── Water depth (Coast / Ocean / DeepOcean) ──────────────────────────────────
 
-fn assign_water_depth(gen: &mut [TileGen], by_coord: &HashMap<HexCoord, usize>) {
-    let land_coords: HashMap<HexCoord, ()> = gen
-        .iter()
-        .filter(|t| t.is_land())
-        .map(|t| (t.coord, ()))
-        .collect();
+fn assign_water_depth(gen: &mut [TileGen], by_coord: &TileIndex) {
+    // BFS distance from land for every water tile, but stored in a flat
+    // `Vec<i32>` indexed by `gen` index instead of a hash map. `-1` = "not yet
+    // visited". Land is also marked 0 so we can skip the land-vs-water check
+    // entirely while traversing neighbours.
+    let n = gen.len();
+    let mut dist_to_land: Vec<i32> = vec![-1; n];
+    let mut queue: VecDeque<usize> = VecDeque::with_capacity(n / 8);
 
-    let in_map: HashMap<HexCoord, ()> = by_coord.keys().map(|&c| (c, ())).collect();
-
-    let mut dist_to_land: HashMap<HexCoord, i32> = HashMap::new();
-    let mut queue: VecDeque<HexCoord> = VecDeque::new();
-
-    for tile in gen.iter().filter(|t| t.is_land()) {
-        dist_to_land.insert(tile.coord, 0);
-        queue.push_back(tile.coord);
-    }
-
-    while let Some(c) = queue.pop_front() {
-        let d = dist_to_land[&c];
-        for n in c.neighbors() {
-            if dist_to_land.contains_key(&n) || land_coords.contains_key(&n) {
-                continue;
-            }
-            if !in_map.contains_key(&n) {
-                continue;
-            }
-            dist_to_land.insert(n, d + 1);
-            queue.push_back(n);
+    for (i, tile) in gen.iter().enumerate() {
+        if tile.is_land() {
+            dist_to_land[i] = 0;
+            queue.push_back(i);
         }
     }
 
-    for tile in gen.iter_mut() {
+    while let Some(idx) = queue.pop_front() {
+        let d = dist_to_land[idx];
+        let coord = gen[idx].coord;
+        for n_coord in coord.neighbors() {
+            let Some(nidx) = by_coord.get(n_coord) else {
+                continue;
+            };
+            if dist_to_land[nidx] >= 0 {
+                continue;
+            }
+            dist_to_land[nidx] = d + 1;
+            queue.push_back(nidx);
+        }
+    }
+
+    for (i, tile) in gen.iter_mut().enumerate() {
         if tile.is_land() {
             continue;
         }
-        let d = dist_to_land
-            .get(&tile.coord)
-            .copied()
-            .unwrap_or(DEEP_OCEAN_MIN_DIST);
+        let d = if dist_to_land[i] < 0 {
+            DEEP_OCEAN_MIN_DIST
+        } else {
+            dist_to_land[i]
+        };
         tile.terrain = if d <= COAST_MAX_DIST {
             TerrainType::Coast
         } else if d >= DEEP_OCEAN_MIN_DIST {
@@ -469,23 +801,26 @@ fn assign_water_depth(gen: &mut [TileGen], by_coord: &HashMap<HexCoord, usize>) 
 /// same terrain type with the modal non-water, non-beach neighbour. Only acts
 /// when the tile has at least two real-land neighbours, so coastal peninsulas
 /// are left alone.
-fn speckle_cleanup(gen: &mut [TileGen], by_coord: &HashMap<HexCoord, usize>) {
-    let mut changes: Vec<(HexCoord, TerrainType)> = Vec::new();
+fn speckle_cleanup(gen: &mut [TileGen], by_coord: &TileIndex) {
+    let mut changes: Vec<(usize, TerrainType)> = Vec::new();
+    let mut counts: FxHashMap<TerrainType, i32> =
+        FxHashMap::with_capacity_and_hasher(8, Default::default());
 
-    for tile in gen.iter() {
+    for (i, tile) in gen.iter().enumerate() {
         if !tile.is_outer_island() {
             continue;
         }
-        if tile.terrain == TerrainType::Beach {
+        // Beach and Freshwater are leave-alone surfaces.
+        if tile.terrain == TerrainType::Beach || is_water(tile.terrain) {
             continue;
         }
 
         let mut same = 0;
         let mut land_neighbors = 0;
-        let mut counts: HashMap<TerrainType, i32> = HashMap::new();
+        counts.clear();
 
         for n in tile.coord.neighbors() {
-            let Some(&idx) = by_coord.get(&n) else {
+            let Some(idx) = by_coord.get(n) else {
                 continue;
             };
             let nt = gen[idx].terrain;
@@ -503,18 +838,16 @@ fn speckle_cleanup(gen: &mut [TileGen], by_coord: &HashMap<HexCoord, usize>) {
         if land_neighbors < 2 || same > 0 {
             continue;
         }
-        if let Some((replacement, _)) = counts
-            .into_iter()
-            .max_by(|a, b| a.1.cmp(&b.1).then_with(|| (a.0 as u8).cmp(&(b.0 as u8))))
-        {
-            changes.push((tile.coord, replacement));
+        if let Some((replacement, _)) = counts.iter().max_by(|a, b| {
+            a.1.cmp(b.1)
+                .then_with(|| (*a.0 as u8).cmp(&(*b.0 as u8)))
+        }) {
+            changes.push((i, *replacement));
         }
     }
 
-    for (coord, terrain) in changes {
-        if let Some(&idx) = by_coord.get(&coord) {
-            gen[idx].terrain = terrain;
-        }
+    for (idx, terrain) in changes {
+        gen[idx].terrain = terrain;
     }
 }
 
@@ -522,10 +855,7 @@ fn speckle_cleanup(gen: &mut [TileGen], by_coord: &HashMap<HexCoord, usize>) {
 
 #[cfg(test)]
 fn is_land_biome(t: TerrainType) -> bool {
-    !matches!(
-        t,
-        TerrainType::DeepOcean | TerrainType::Ocean | TerrainType::Coast
-    )
+    !is_water(t)
 }
 
 fn terrain_name(t: TerrainType) -> &'static str {
@@ -533,6 +863,7 @@ fn terrain_name(t: TerrainType) -> &'static str {
         TerrainType::DeepOcean => "DeepOcean",
         TerrainType::Ocean => "Ocean",
         TerrainType::Coast => "Coast",
+        TerrainType::Freshwater => "Freshwater",
         TerrainType::Beach => "Beach",
         TerrainType::Hills => "Hills",
         TerrainType::Mountain => "Mountain",
@@ -562,7 +893,8 @@ fn terrain_name(t: TerrainType) -> &'static str {
 
 fn log_distribution(tiles: &[HexTile]) {
     let total = tiles.len() as f64;
-    let mut counts: HashMap<TerrainType, usize> = HashMap::new();
+    let mut counts: FxHashMap<TerrainType, usize> =
+        FxHashMap::with_capacity_and_hasher(32, Default::default());
     for tile in tiles {
         *counts.entry(tile.terrain).or_default() += 1;
     }
@@ -571,6 +903,7 @@ fn log_distribution(tiles: &[HexTile]) {
         TerrainType::DeepOcean,
         TerrainType::Ocean,
         TerrainType::Coast,
+        TerrainType::Freshwater,
         TerrainType::Beach,
         TerrainType::Plains,
         TerrainType::Greenfield,
@@ -602,11 +935,15 @@ fn log_distribution(tiles: &[HexTile]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
 
     // Steppe, Hills, and AridPeak are intentionally disabled — the generator
+    // never emits them. Freshwater is the new inland-lake tile; it appears on
+    // outer islands at the centre of lakes, surrounded by Beach.
     // must not emit them on outer islands until they are re-enabled.
     const ALLOWED_OUTER_LAND: &[TerrainType] = &[
         TerrainType::Beach,
+        TerrainType::Freshwater,
         TerrainType::Plains,
         TerrainType::Greenfield,
         TerrainType::Oldwood,
@@ -695,9 +1032,14 @@ mod tests {
         let by_coord: HashMap<HexCoord, TerrainType> =
             map.tiles.iter().map(|t| (t.coord, t.terrain)).collect();
 
-        // Every water tile adjacent to land must be Coast.
+        // Every ocean-side water tile adjacent to land must be Coast.
+        // Freshwater (inland lakes) is water too but lives on land and is not
+        // part of the ocean depth gradient — skip it here.
         for tile in &map.tiles {
             if !is_water(tile.terrain) {
+                continue;
+            }
+            if tile.terrain == TerrainType::Freshwater {
                 continue;
             }
             let touches_land = tile
@@ -780,9 +1122,13 @@ mod tests {
 
     #[test]
     fn outer_islands_each_have_full_palette() {
-        // Steppe / AridPeak intentionally excluded — not generated for now.
+        // Per-island contract: both active base biomes plus at least one
+        // forest and one mountain tile. Specific forest types are NOT required
+        // per island — patch-unification can drop a minority type from a
+        // crescent. That's exercised at the map-wide level below.
+        // Steppe / AridPeak / Hills are intentionally not generated.
         let required_bases = [TerrainType::Plains, TerrainType::Greenfield];
-        let required_forests = [
+        let all_forest_types = [
             TerrainType::Oldwood,
             TerrainType::Darkpine,
             TerrainType::Deepjungle,
@@ -793,6 +1139,9 @@ mod tests {
             let by_island = crescent_land_by_island(&map, seed);
             let terrains: HashMap<HexCoord, TerrainType> =
                 map.tiles.iter().map(|t| (t.coord, t.terrain)).collect();
+
+            let mut map_wide_forests: std::collections::HashSet<TerrainType> =
+                std::collections::HashSet::new();
 
             for (i, land) in by_island.iter().enumerate() {
                 let present: std::collections::HashSet<TerrainType> = land
@@ -807,17 +1156,28 @@ mod tests {
                         t
                     );
                 }
-                for t in required_forests {
-                    assert!(
-                        present.contains(&t),
-                        "seed {seed} crescent {i} missing forest type {:?}",
-                        t
-                    );
-                }
+                let has_forest = present.iter().any(|t| is_outer_forest(*t));
+                assert!(has_forest, "seed {seed} crescent {i} has no forest");
                 let has_mountain = present.iter().any(|t| is_outer_mountain(*t));
                 assert!(
                     has_mountain,
                     "seed {seed} crescent {i} has no mountain tile"
+                );
+
+                for t in all_forest_types {
+                    if present.contains(&t) {
+                        map_wide_forests.insert(t);
+                    }
+                }
+            }
+
+            // Across the three crescents combined, every forest type should
+            // show up somewhere so the world isn't missing a flavour entirely.
+            for t in all_forest_types {
+                assert!(
+                    map_wide_forests.contains(&t),
+                    "seed {seed}: no crescent has forest type {:?}",
+                    t
                 );
             }
         }

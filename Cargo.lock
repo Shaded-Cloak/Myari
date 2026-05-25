@@ -2795,6 +2795,8 @@ dependencies = [
  "glam",
  "hexx",
  "rand",
+ "rayon",
+ "rustc-hash 2.1.2",
  "serde",
  "serde_json",
 ]
