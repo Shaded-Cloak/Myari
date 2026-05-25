@@ -1,4 +1,4 @@
-//! Noise-driven terrain classifier for the three crescent outer islands.
+//! Noise-driven terrain classifier for all land islands (center + crescents).
 //!
 //! Every decision is a soft, wobble-perturbed threshold on smooth, domain
 //! warped noise fields. There is no patch growing, no fixed seeding, and no
@@ -23,6 +23,9 @@ use crate::map::TerrainType;
 use crate::rng::{hash_seed, pick_index, seed_to_i32};
 
 const CRESCENT_ANGLES: [f32; 3] = [90.0, 210.0, 330.0];
+
+/// Island id passed to [`classify_all`] for the central Old Empire landmass.
+pub const CENTER_ISLAND_ID: u8 = 3;
 
 /// Minimum BFS distance from the coast a tile must have before mountains can
 /// form on it. Beach + the next two rings are always non-mountain.
@@ -88,14 +91,30 @@ const PRESETS: [Personality; 3] = [
 
 /// Pre-dilation. The post-pass adds one ring of StonySlope around every kept
 /// mountain core, so effective coverage roughly doubles after cleanup.
-const MOUNTAIN_UPPER_TARGET: f32 = 0.010;
+const MOUNTAIN_UPPER_TARGET: f32 = 0.014;
 const MOUNTAIN_LOWER_TARGET: f32 = 0.05;
 
+/// Minimum SnowPeak count per connected mountain range. Larger ranges scale
+/// up via `range_total / SNOW_PEAK_DENOMINATOR`.
+const MIN_SNOW_PEAKS_PER_RANGE: usize = 5;
+const SNOW_PEAK_DENOMINATOR: usize = 6;
+
+/// Post-dilation connected mountain ranges smaller than this revert to base
+/// biome — they read as accidental bumps, not ranges.
+const MIN_MOUNTAIN_RANGE_SIZE: usize = 30;
+
+/// StonySlope farther than this (hex steps through mountain) from the nearest
+/// SnowPeak is trimmed — removes stone spurs and bulges with no crest.
+const MAX_STONY_DISTANCE_FROM_PEAK: usize = 5;
+
 /// Minimum number of tiles a forest patch must have to survive cleanup.
-/// Anything smaller gets reverted to its natural base biome — kills the 1-5
-/// tile speckle the noise threshold occasionally produces without touching
-/// any real forest.
-const MIN_FOREST_PATCH_SIZE: usize = 6;
+/// Anything smaller gets reverted to its natural base biome.
+const MIN_FOREST_PATCH_SIZE: usize = 10;
+
+/// Small forest patches farther than this (through land) from any other forest
+/// on the same island are lone copses and get reverted.
+const ISOLATED_FOREST_MAX_SIZE: usize = 18;
+const ISOLATED_FOREST_MIN_GAP: usize = 5;
 
 const PERMUTATIONS: [[usize; 3]; 6] = [
     [0, 1, 2],
@@ -111,6 +130,14 @@ const PERMUTATIONS: [[usize; 3]; 6] = [
 fn assign_personalities(world_seed: u64) -> [Personality; 3] {
     let perm = PERMUTATIONS[pick_index(world_seed, 99, 7, PERMUTATIONS.len())];
     [PRESETS[perm[0]], PRESETS[perm[1]], PRESETS[perm[2]]]
+}
+
+fn personality_for(world_seed: u64, island_id: u8) -> Personality {
+    if island_id == CENTER_ISLAND_ID {
+        PRESETS[pick_index(world_seed, CENTER_ISLAND_ID, 19, PRESETS.len())]
+    } else {
+        assign_personalities(world_seed)[island_id as usize]
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -215,11 +242,13 @@ fn layout_xy(q: i32, r: i32) -> Vec2 {
     Vec2::new(p.x, p.y)
 }
 
-/// Per-island local frame rotated so the crescent's radial axis aligns with
-/// the local Y axis. Sampling in this frame keeps noise patterns consistent
-/// relative to each island's shape regardless of where it sits on the map.
+/// Per-island local frame. Crescents rotate so the radial axis aligns with +Y;
+/// the center disk uses world layout coordinates (rotation is a no-op).
 fn local_frame(coord: HexCoord, island_id: u8) -> (f32, f32) {
     let pos = layout_xy(coord.q, coord.r);
+    if island_id == CENTER_ISLAND_ID {
+        return (pos.x, pos.y);
+    }
     let theta = CRESCENT_ANGLES[island_id as usize].to_radians();
     let lx = pos.x * theta.cos() + pos.y * theta.sin();
     let ly = -pos.x * theta.sin() + pos.y * theta.cos();
@@ -387,34 +416,21 @@ fn normalize(fields: Fields, stats: &FieldStats) -> Fields {
     }
 }
 
-/// Classify every land tile of every outer (crescent) island.
+/// Classify every land tile of each supplied island.
 ///
-/// `islands` is a slice of `(island_id, land_tiles, inland_distances)` tuples,
-/// one entry per non-empty crescent. The returned map covers every tile
-/// supplied in `land_tiles`; callers are expected to skip applying the
-/// classification to beach tiles (the shoreline strip is already assigned).
-///
-/// Within each island the gates for mountain / forest are **per-island
-/// percentile thresholds**: a target fraction of inland-eligible tiles become
-/// mountain, and a target fraction of non-mountain tiles become forest. This
-/// guarantees budget balance across the three crescents (test contract ≤ 4 pp)
-/// while leaving the noise patterns — *which* tiles are picked — fully
-/// distinct per island.
+/// `islands` is a slice of `(island_id, land_tiles, inland_distances)` tuples.
+/// Use [`CENTER_ISLAND_ID`] for the center landmass and `0..2` for crescents.
+/// Callers should not overwrite beach or freshwater tiles when applying results.
 pub fn classify_all(
     world_seed: u64,
     islands: &[(u8, Vec<HexCoord>, FxHashMap<HexCoord, i32>)],
 ) -> FxHashMap<HexCoord, TerrainType> {
-    let personalities = assign_personalities(world_seed);
     let total_land: usize = islands.iter().map(|(_, l, _)| l.len()).sum();
     let mut out: FxHashMap<HexCoord, TerrainType> =
         FxHashMap::with_capacity_and_hasher(total_land, Default::default());
 
     for (island_id, land, inland) in islands {
-        let id = *island_id as usize;
-        if id >= 3 {
-            continue;
-        }
-        let p = personalities[id];
+        let p = personality_for(world_seed, *island_id);
         let noise = IslandNoise::for_island(world_seed, *island_id);
 
         // Pass 1: sample raw fields and inland distance for each tile.
@@ -488,11 +504,9 @@ pub fn classify_all(
         // this only smooths the boundary inside each patch.
         unify_forest_patches(land, &mut out);
 
-        // Pass 6: drop forest patches below `MIN_FOREST_PATCH_SIZE` back to
-        // their natural base biome (Plains / Greenfield). The forest noise +
-        // threshold occasionally produces 1-5 tile speckle that reads as
-        // accidental rather than designed; this pass removes only those.
+        // Pass 6: drop tiny or isolated forest copses back to base biome.
         drop_small_forest_patches(land, &mut out, &normalized, &p);
+        drop_isolated_forest_copses(land, &mut out, &normalized, &p);
 
         // Pass 7: mountain cleanup.
         //  - Drop any connected mountain component that has no SnowPeak (no
@@ -500,6 +514,8 @@ pub fn classify_all(
         //  - Dilate the surviving cores by one hex of StonySlope, which both
         //    thickens the bases and guarantees every SnowPeak is ringed by
         //    StonySlope on all sides.
+        //  - Promote StonySlope to SnowPeak until each range meets a minimum
+        //    peak count; ring every peak in StonySlope; drop tiny ranges.
         cleanup_mountains(land, &mut out, &normalized, &p);
     }
 
@@ -579,10 +595,7 @@ fn unify_forest_patches(land: &[HexCoord], terrains: &mut FxHashMap<HexCoord, Te
 }
 
 /// Walk each connected forest patch; any patch smaller than
-/// `MIN_FOREST_PATCH_SIZE` is reverted tile-by-tile to its natural base biome
-/// (same `base_biome` call the original classifier would have made). This
-/// removes the occasional 1-5 tile speckle without changing where real
-/// forests sit or what type they are.
+/// `MIN_FOREST_PATCH_SIZE` is reverted tile-by-tile to its natural base biome.
 fn drop_small_forest_patches(
     land: &[HexCoord],
     terrains: &mut FxHashMap<HexCoord, TerrainType>,
@@ -639,9 +652,117 @@ fn drop_small_forest_patches(
 
         if component.len() < MIN_FOREST_PATCH_SIZE {
             for c in component {
-                if let Some(fields) = field_by_coord.get(&c) {
-                    terrains.insert(c, base_biome(fields, p));
+                revert_to_base(c, terrains, &field_by_coord, p);
+            }
+        }
+    }
+}
+
+/// Drop small forest patches that sit alone on the island — not within
+/// `ISOLATED_FOREST_MIN_GAP` land steps of any other forest.
+fn drop_isolated_forest_copses(
+    land: &[HexCoord],
+    terrains: &mut FxHashMap<HexCoord, TerrainType>,
+    normalized: &[(HexCoord, Fields, i32)],
+    p: &Personality,
+) {
+    let mut land_set: FxHashSet<HexCoord> =
+        FxHashSet::with_capacity_and_hasher(land.len(), Default::default());
+    for &c in land {
+        land_set.insert(c);
+    }
+    let mut field_by_coord: FxHashMap<HexCoord, Fields> =
+        FxHashMap::with_capacity_and_hasher(normalized.len(), Default::default());
+    for (c, f, _) in normalized {
+        field_by_coord.insert(*c, *f);
+    }
+    let mut visited: FxHashSet<HexCoord> =
+        FxHashSet::with_capacity_and_hasher(land.len(), Default::default());
+
+    let mut starts: Vec<HexCoord> = land.to_vec();
+    starts.sort_by_key(|c| (c.q, c.r));
+
+    for start in starts {
+        if visited.contains(&start) {
+            continue;
+        }
+        let Some(&t0) = terrains.get(&start) else {
+            continue;
+        };
+        if !is_forest(t0) {
+            continue;
+        }
+
+        let mut component: Vec<HexCoord> = Vec::new();
+        let mut queue: VecDeque<HexCoord> = VecDeque::from([start]);
+        visited.insert(start);
+
+        while let Some(c) = queue.pop_front() {
+            component.push(c);
+            for n in c.neighbors() {
+                if !land_set.contains(&n) || visited.contains(&n) {
+                    continue;
                 }
+                let Some(&nt) = terrains.get(&n) else {
+                    continue;
+                };
+                if !is_forest(nt) {
+                    continue;
+                }
+                visited.insert(n);
+                queue.push_back(n);
+            }
+        }
+
+        if component.len() > ISOLATED_FOREST_MAX_SIZE {
+            continue;
+        }
+
+        let component_set: FxHashSet<HexCoord> =
+            component.iter().copied().collect();
+        let other_forest: Vec<HexCoord> = land
+            .iter()
+            .filter(|&&c| {
+                terrains.get(&c).is_some_and(|&t| is_forest(t)) && !component_set.contains(&c)
+            })
+            .copied()
+            .collect();
+        if other_forest.is_empty() {
+            continue;
+        }
+
+        let mut dist: FxHashMap<HexCoord, usize> =
+            FxHashMap::with_capacity_and_hasher(land.len() / 4, Default::default());
+        let mut bfs: VecDeque<HexCoord> = VecDeque::new();
+        for s in other_forest {
+            dist.insert(s, 0);
+            bfs.push_back(s);
+        }
+        let mut min_to_other = usize::MAX;
+        while let Some(c) = bfs.pop_front() {
+            let d = dist[&c];
+            if d >= ISOLATED_FOREST_MIN_GAP {
+                continue;
+            }
+            if component_set.contains(&c) {
+                min_to_other = min_to_other.min(d);
+                if min_to_other == 0 {
+                    break;
+                }
+                continue;
+            }
+            for n in c.neighbors() {
+                if !land_set.contains(&n) || dist.contains_key(&n) {
+                    continue;
+                }
+                dist.insert(n, d + 1);
+                bfs.push_back(n);
+            }
+        }
+
+        if min_to_other > ISOLATED_FOREST_MIN_GAP {
+            for c in component {
+                revert_to_base(c, terrains, &field_by_coord, p);
             }
         }
     }
@@ -660,6 +781,13 @@ fn is_mountain(t: TerrainType) -> bool {
 ///      proper mountain mass instead of single-tile spines, and guarantees
 ///      every SnowPeak ends up surrounded by StonySlope on all six sides.
 ///      Beach and Freshwater are protected from the dilation.
+///   3. Promote StonySlope adjacent to existing SnowPeak until each range has
+///      at least `max(MIN_SNOW_PEAKS_PER_RANGE, total / SNOW_PEAK_DENOMINATOR)`
+///      peaks (interior fallback only when the range cannot grow outward).
+///   4. Ring SnowPeak on grass/forest neighbours; trim StonySlope farther than
+///      `MAX_STONY_DISTANCE_FROM_PEAK` from any peak; drop stone-only scraps;
+///      demote peaks that still touch beach or non-mountain land.
+///   5. Revert any range still smaller than `MIN_MOUNTAIN_RANGE_SIZE`.
 fn cleanup_mountains(
     land: &[HexCoord],
     terrains: &mut FxHashMap<HexCoord, TerrainType>,
@@ -759,6 +887,467 @@ fn cleanup_mountains(
     for c in to_thicken {
         terrains.insert(c, TerrainType::StonySlope);
     }
+
+    // Step 3: enough SnowPeak per range that crests read after dilation.
+    visited.clear();
+    let mut starts: Vec<HexCoord> = land.to_vec();
+    starts.sort_by_key(|c| (c.q, c.r));
+
+    for start in starts {
+        if visited.contains(&start) {
+            continue;
+        }
+        let Some(&t0) = terrains.get(&start) else {
+            continue;
+        };
+        if !is_mountain(t0) {
+            continue;
+        }
+
+        let mut component: Vec<HexCoord> = Vec::new();
+        let mut peak_count = 0usize;
+        let mut queue: VecDeque<HexCoord> = VecDeque::from([start]);
+        visited.insert(start);
+
+        while let Some(c) = queue.pop_front() {
+            let Some(&t) = terrains.get(&c) else {
+                continue;
+            };
+            component.push(c);
+            if t == TerrainType::SnowPeak {
+                peak_count += 1;
+            }
+            for n in c.neighbors() {
+                if !land_set.contains(&n) || visited.contains(&n) {
+                    continue;
+                }
+                let Some(&nt) = terrains.get(&n) else {
+                    continue;
+                };
+                if !is_mountain(nt) {
+                    continue;
+                }
+                visited.insert(n);
+                queue.push_back(n);
+            }
+        }
+
+        let target_peaks = (component.len() / SNOW_PEAK_DENOMINATOR)
+            .max(MIN_SNOW_PEAKS_PER_RANGE);
+        if peak_count >= target_peaks {
+            continue;
+        }
+
+        let component_set: FxHashSet<HexCoord> =
+            component.iter().copied().collect();
+        let mut peaks: FxHashSet<HexCoord> = component
+            .iter()
+            .filter(|&&c| terrains.get(&c) == Some(&TerrainType::SnowPeak))
+            .copied()
+            .collect();
+
+        while peak_count < target_peaks {
+            let mut candidates: Vec<(HexCoord, f32)> = Vec::new();
+            for &p in &peaks {
+                for n in p.neighbors() {
+                    if !component_set.contains(&n) {
+                        continue;
+                    }
+                    if terrains.get(&n) != Some(&TerrainType::StonySlope) {
+                        continue;
+                    }
+                    let score = field_by_coord
+                        .get(&n)
+                        .map(mountain_score)
+                        .unwrap_or(0.0);
+                    candidates.push((n, score));
+                }
+            }
+            if candidates.is_empty() {
+                candidates = component
+                    .iter()
+                    .filter_map(|&c| {
+                        if terrains.get(&c) != Some(&TerrainType::StonySlope) {
+                            return None;
+                        }
+                        if !is_interior_mountain(c, terrains, &land_set) {
+                            return None;
+                        }
+                        let score = field_by_coord
+                            .get(&c)
+                            .map(mountain_score)
+                            .unwrap_or(0.0);
+                        Some((c, score))
+                    })
+                    .collect();
+            }
+            candidates.sort_by(|a, b| {
+                b.1.partial_cmp(&a.1)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| (a.0.q, a.0.r).cmp(&(b.0.q, b.0.r)))
+            });
+            let Some((c, _)) = candidates.first().copied() else {
+                break;
+            };
+            terrains.insert(c, TerrainType::SnowPeak);
+            peaks.insert(c);
+            peak_count += 1;
+        }
+    }
+
+    ring_snow_on_land(land, terrains, &land_set);
+    trim_stony_far_from_peaks(
+        land,
+        terrains,
+        &land_set,
+        &field_by_coord,
+        p,
+        MAX_STONY_DISTANCE_FROM_PEAK,
+    );
+    drop_mountain_components_without_peaks(land, terrains, &land_set, &field_by_coord, p);
+    for _ in 0..8 {
+        ring_snow_on_land(land, terrains, &land_set);
+        if !demote_snow_on_exposed_land(land, terrains, &land_set) {
+            break;
+        }
+    }
+
+    // Step 4b: lone SnowPeak tiles — grow one adjacent crest, then re-ring.
+    bridge_isolated_snow_peaks(land, terrains, &land_set, &field_by_coord);
+    ring_snow_on_land(land, terrains, &land_set);
+    demote_snow_on_exposed_land(land, terrains, &land_set);
+
+    // Step 5: drop ranges that are still too small to read as mountains.
+    visited.clear();
+    let mut size_starts: Vec<HexCoord> = land.to_vec();
+    size_starts.sort_by_key(|c| (c.q, c.r));
+    for start in size_starts {
+        if visited.contains(&start) {
+            continue;
+        }
+        let Some(&t0) = terrains.get(&start) else {
+            continue;
+        };
+        if !is_mountain(t0) {
+            continue;
+        }
+
+        let mut component: Vec<HexCoord> = Vec::new();
+        let mut queue: VecDeque<HexCoord> = VecDeque::from([start]);
+        visited.insert(start);
+
+        while let Some(c) = queue.pop_front() {
+            component.push(c);
+            for n in c.neighbors() {
+                if !land_set.contains(&n) || visited.contains(&n) {
+                    continue;
+                }
+                let Some(&nt) = terrains.get(&n) else {
+                    continue;
+                };
+                if !is_mountain(nt) {
+                    continue;
+                }
+                visited.insert(n);
+                queue.push_back(n);
+            }
+        }
+
+        if component.len() >= MIN_MOUNTAIN_RANGE_SIZE {
+            continue;
+        }
+        for c in component {
+            if let Some(fields) = field_by_coord.get(&c) {
+                terrains.insert(c, base_biome(fields, p));
+            }
+        }
+    }
+}
+
+fn revert_to_base(
+    coord: HexCoord,
+    terrains: &mut FxHashMap<HexCoord, TerrainType>,
+    field_by_coord: &FxHashMap<HexCoord, Fields>,
+    p: &Personality,
+) {
+    if let Some(fields) = field_by_coord.get(&coord) {
+        terrains.insert(coord, base_biome(fields, p));
+    }
+}
+
+/// Grass/forest neighbours of SnowPeak become foothill stone (not beach/lakes).
+fn ring_snow_on_land(
+    land: &[HexCoord],
+    terrains: &mut FxHashMap<HexCoord, TerrainType>,
+    land_set: &FxHashSet<HexCoord>,
+) {
+    for &c in land {
+        if terrains.get(&c) != Some(&TerrainType::SnowPeak) {
+            continue;
+        }
+        for n in c.neighbors() {
+            if !land_set.contains(&n) {
+                continue;
+            }
+            let Some(&nt) = terrains.get(&n) else {
+                continue;
+            };
+            if matches!(nt, TerrainType::Beach | TerrainType::Freshwater) {
+                continue;
+            }
+            if !is_mountain(nt) {
+                terrains.insert(n, TerrainType::StonySlope);
+            }
+        }
+    }
+}
+
+/// Remove StonySlope not within `max_dist` hex steps (through mountain) of any
+/// SnowPeak in the same connected range.
+fn trim_stony_far_from_peaks(
+    land: &[HexCoord],
+    terrains: &mut FxHashMap<HexCoord, TerrainType>,
+    land_set: &FxHashSet<HexCoord>,
+    field_by_coord: &FxHashMap<HexCoord, Fields>,
+    p: &Personality,
+    max_dist: usize,
+) {
+    let mut visited: FxHashSet<HexCoord> =
+        FxHashSet::with_capacity_and_hasher(land.len(), Default::default());
+    let mut starts: Vec<HexCoord> = land.to_vec();
+    starts.sort_by_key(|c| (c.q, c.r));
+
+    for start in starts {
+        if visited.contains(&start) {
+            continue;
+        }
+        let Some(&t0) = terrains.get(&start) else {
+            continue;
+        };
+        if !is_mountain(t0) {
+            continue;
+        }
+
+        let mut component: Vec<HexCoord> = Vec::new();
+        let mut queue: VecDeque<HexCoord> = VecDeque::from([start]);
+        visited.insert(start);
+
+        while let Some(c) = queue.pop_front() {
+            component.push(c);
+            for n in c.neighbors() {
+                if !land_set.contains(&n) || visited.contains(&n) {
+                    continue;
+                }
+                let Some(&nt) = terrains.get(&n) else {
+                    continue;
+                };
+                if !is_mountain(nt) {
+                    continue;
+                }
+                visited.insert(n);
+                queue.push_back(n);
+            }
+        }
+
+        let component_set: FxHashSet<HexCoord> =
+            component.iter().copied().collect();
+        let snow_tiles: Vec<HexCoord> = component
+            .iter()
+            .filter(|&&c| terrains.get(&c) == Some(&TerrainType::SnowPeak))
+            .copied()
+            .collect();
+        if snow_tiles.is_empty() {
+            for c in component {
+                revert_to_base(c, terrains, field_by_coord, p);
+            }
+            continue;
+        }
+
+        let mut dist: FxHashMap<HexCoord, usize> =
+            FxHashMap::with_capacity_and_hasher(component.len(), Default::default());
+        let mut bfs: VecDeque<HexCoord> = VecDeque::new();
+        for s in snow_tiles {
+            dist.insert(s, 0);
+            bfs.push_back(s);
+        }
+        while let Some(c) = bfs.pop_front() {
+            let d = dist[&c];
+            if d >= max_dist {
+                continue;
+            }
+            for n in c.neighbors() {
+                if !component_set.contains(&n) || dist.contains_key(&n) {
+                    continue;
+                }
+                dist.insert(n, d + 1);
+                bfs.push_back(n);
+            }
+        }
+
+        for c in component {
+            if terrains.get(&c) != Some(&TerrainType::StonySlope) {
+                continue;
+            }
+            if dist.get(&c).is_none_or(|&d| d > max_dist) {
+                revert_to_base(c, terrains, field_by_coord, p);
+            }
+        }
+    }
+}
+
+/// Revert whole mountain components that contain no SnowPeak (stone-only arms).
+fn drop_mountain_components_without_peaks(
+    land: &[HexCoord],
+    terrains: &mut FxHashMap<HexCoord, TerrainType>,
+    land_set: &FxHashSet<HexCoord>,
+    field_by_coord: &FxHashMap<HexCoord, Fields>,
+    p: &Personality,
+) {
+    let mut visited: FxHashSet<HexCoord> =
+        FxHashSet::with_capacity_and_hasher(land.len(), Default::default());
+    let mut starts: Vec<HexCoord> = land.to_vec();
+    starts.sort_by_key(|c| (c.q, c.r));
+
+    for start in starts {
+        if visited.contains(&start) {
+            continue;
+        }
+        let Some(&t0) = terrains.get(&start) else {
+            continue;
+        };
+        if !is_mountain(t0) {
+            continue;
+        }
+
+        let mut component: Vec<HexCoord> = Vec::new();
+        let mut has_peak = false;
+        let mut queue: VecDeque<HexCoord> = VecDeque::from([start]);
+        visited.insert(start);
+
+        while let Some(c) = queue.pop_front() {
+            let Some(&t) = terrains.get(&c) else {
+                continue;
+            };
+            component.push(c);
+            if t == TerrainType::SnowPeak {
+                has_peak = true;
+            }
+            for n in c.neighbors() {
+                if !land_set.contains(&n) || visited.contains(&n) {
+                    continue;
+                }
+                let Some(&nt) = terrains.get(&n) else {
+                    continue;
+                };
+                if !is_mountain(nt) {
+                    continue;
+                }
+                visited.insert(n);
+                queue.push_back(n);
+            }
+        }
+
+        if has_peak {
+            continue;
+        }
+        for c in component {
+            revert_to_base(c, terrains, field_by_coord, p);
+        }
+    }
+}
+
+/// Demote SnowPeak that still touch beach or non-mountain land (cannot be
+/// ringed in stone). Returns true if any tile changed.
+fn demote_snow_on_exposed_land(
+    land: &[HexCoord],
+    terrains: &mut FxHashMap<HexCoord, TerrainType>,
+    land_set: &FxHashSet<HexCoord>,
+) -> bool {
+    let mut demote: Vec<HexCoord> = Vec::new();
+    for &c in land {
+        if terrains.get(&c) != Some(&TerrainType::SnowPeak) {
+            continue;
+        }
+        let exposed = c.neighbors().iter().any(|&n| {
+            if !land_set.contains(&n) {
+                return false;
+            }
+            let Some(&nt) = terrains.get(&n) else {
+                return false;
+            };
+            matches!(nt, TerrainType::Beach | TerrainType::Freshwater) || !is_mountain(nt)
+        });
+        if exposed {
+            demote.push(c);
+        }
+    }
+    if demote.is_empty() {
+        return false;
+    }
+    for c in demote {
+        terrains.insert(c, TerrainType::StonySlope);
+    }
+    true
+}
+
+fn bridge_isolated_snow_peaks(
+    land: &[HexCoord],
+    terrains: &mut FxHashMap<HexCoord, TerrainType>,
+    land_set: &FxHashSet<HexCoord>,
+    field_by_coord: &FxHashMap<HexCoord, Fields>,
+) {
+    let mut bridge_starts: Vec<HexCoord> = land.to_vec();
+    bridge_starts.sort_by_key(|c| (c.q, c.r));
+    for c in bridge_starts {
+        if terrains.get(&c) != Some(&TerrainType::SnowPeak) {
+            continue;
+        }
+        let has_snow_neighbor = c.neighbors().iter().any(|&n| {
+            land_set.contains(&n) && terrains.get(&n) == Some(&TerrainType::SnowPeak)
+        });
+        if has_snow_neighbor {
+            continue;
+        }
+        let mut best: Option<(HexCoord, f32)> = None;
+        for n in c.neighbors() {
+            if !land_set.contains(&n) {
+                continue;
+            }
+            if terrains.get(&n) != Some(&TerrainType::StonySlope) {
+                continue;
+            }
+            let score = field_by_coord
+                .get(&n)
+                .map(mountain_score)
+                .unwrap_or(0.0);
+            let replace = best.as_ref().is_none_or(|(_, s)| score > *s);
+            if replace {
+                best = Some((n, score));
+            }
+        }
+        if let Some((n, _)) = best {
+            terrains.insert(n, TerrainType::SnowPeak);
+        }
+    }
+}
+
+fn is_interior_mountain(
+    coord: HexCoord,
+    terrains: &FxHashMap<HexCoord, TerrainType>,
+    land_set: &FxHashSet<HexCoord>,
+) -> bool {
+    for n in coord.neighbors() {
+        if !land_set.contains(&n) {
+            return false;
+        }
+        let Some(&nt) = terrains.get(&n) else {
+            return false;
+        };
+        if !is_mountain(nt) {
+            return false;
+        }
+    }
+    true
 }
 
 fn classify_non_mountain(
