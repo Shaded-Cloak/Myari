@@ -3,6 +3,7 @@ mod hexgrid;
 mod map;
 mod outer_islands;
 mod rng;
+mod ui;
 
 use bevy::color::Color;
 use bevy::input::keyboard::KeyCode;
@@ -18,6 +19,10 @@ use std::collections::HashSet;
 use game::GameState;
 use crate::hexgrid::{axial_to_pixel, hex_corners_at, hex_corners_local, pixel_to_hex, HexCoord};
 use map::{Map, HexTile, TerrainType, MAP_RADIUS};
+use ui::{
+    menu_button_bundle, spawn_framed_panel, spawn_ornate_divider, spawn_star_watermark, HudAnchor,
+    UiTheme, BTN_HOVER, BTN_IDLE, BTN_PRESSED, GEM_FRAME, GOLD, GOLD_DIM, PARCHMENT,
+};
 
 const HEX_SIZE: f32 = 28.0;
 
@@ -41,7 +46,11 @@ fn main() {
         .init_resource::<Zoom>()
         .init_resource::<CurrentSeed>()
         .init_resource::<SavePath>()
-        .add_systems(Startup, (setup_camera, spawn_map_and_game, fps_startup, spawn_menu))
+        .add_systems(Startup, (setup_camera, setup_ui_theme))
+        .add_systems(
+            Startup,
+            (spawn_map_and_game, fps_startup, spawn_menu).after(setup_ui_theme),
+        )
         .add_systems(
             Update,
             (
@@ -118,6 +127,9 @@ struct MenuRoot;
 struct GridToggle;
 
 #[derive(Component)]
+struct GridToggleLabel;
+
+#[derive(Component)]
 struct GridMarker;
 
 #[derive(Component)]
@@ -142,7 +154,10 @@ struct HoverNameText;
 struct HoverCategoryText;
 
 #[derive(Component)]
-struct HoverCoordsText;
+struct HoverCoordsQ;
+
+#[derive(Component)]
+struct HoverCoordsR;
 
 #[derive(Component)]
 struct HoverEmptyHint;
@@ -157,6 +172,10 @@ struct UnitMarker {
 struct SavePath(Option<String>);
 
 // ── Startup ─────────────────────────────────────────────────────
+
+fn setup_ui_theme(mut commands: Commands, asset_server: Res<AssetServer>) {
+    commands.insert_resource(UiTheme::load(&asset_server));
+}
 
 fn setup_camera(mut commands: Commands) {
     commands.spawn((
@@ -192,6 +211,7 @@ fn spawn_map_and_game(
     mut materials: ResMut<Assets<ColorMaterial>>,
     mut seed_res: ResMut<CurrentSeed>,
     mut save_path: ResMut<SavePath>,
+    theme: Res<UiTheme>,
 ) {
     println!("spawn_map_and_game called");
     save_path.0 = Some(default_save_path());
@@ -203,38 +223,7 @@ fn spawn_map_and_game(
     commands.insert_resource(GameMap(map));
     commands.insert_resource(gs);
 
-    // Turn counter
-    commands.spawn((
-        Text::new("Turn: 1"),
-        TextFont {
-            font_size: 18.0,
-            ..default()
-        },
-        TextColor(Color::srgb(0.9, 0.9, 0.7)),
-        Node {
-            position_type: PositionType::Absolute,
-            right: Val::Px(10.0),
-            top: Val::Px(10.0),
-            ..default()
-        },
-        TurnText,
-    ));
-
-    commands.spawn((
-        Text::new(format!("Seed: {seed} (R to reroll)")),
-        TextFont {
-            font_size: 16.0,
-            ..default()
-        },
-        TextColor(Color::srgb(0.8, 0.8, 0.9)),
-        Node {
-            position_type: PositionType::Absolute,
-            right: Val::Px(10.0),
-            top: Val::Px(34.0),
-            ..default()
-        },
-        SeedText,
-    ));
+    spawn_game_hud(&mut commands, &theme, seed);
 
     // Hover highlight entity (single hex outline)
     let hm = meshes.add(make_hex_outline_mesh(HEX_SIZE));
@@ -248,49 +237,51 @@ fn spawn_map_and_game(
         Highlight,
     ));
 
-    spawn_hover_panel(&mut commands);
+    spawn_hover_panel(&mut commands, &theme);
 }
 
-fn spawn_hover_panel(commands: &mut Commands) {
-    let label_style = |size: f32| TextFont {
-        font_size: size,
-        ..default()
-    };
-    let muted = Color::srgb(0.52, 0.56, 0.64);
-    let bright = Color::srgb(0.94, 0.95, 0.97);
-    let accent = Color::srgb(0.72, 0.78, 0.88);
+fn spawn_game_hud(commands: &mut Commands, theme: &UiTheme, seed: u64) {
+    spawn_framed_panel(
+        commands,
+        theme,
+        HudAnchor::TopRight {
+            right: 18.0,
+            top: 18.0,
+        },
+        248.0,
+        UiRect::new(Val::Px(16.0), Val::Px(14.0), Val::Px(14.0), Val::Px(16.0)),
+        8.0,
+        |panel, theme| {
+            panel.spawn(theme.label("TURN"));
+            panel.spawn((theme.value("1", 22.0), TurnText));
+            spawn_ornate_divider(panel, theme);
+            panel.spawn(theme.label("SEED"));
+            panel.spawn((theme.value(seed.to_string(), 15.0), SeedText));
+            panel.spawn(theme.hint("Press R to reroll world", 11.0));
+        },
+    );
+}
 
-    commands
-        .spawn((
-            Node {
-                position_type: PositionType::Absolute,
-                left: Val::Px(16.0),
-                bottom: Val::Px(16.0),
-                width: Val::Px(240.0),
-                flex_direction: FlexDirection::Column,
-                padding: UiRect::all(Val::Px(14.0)),
-                row_gap: Val::Px(10.0),
-                border: UiRect::all(Val::Px(1.0)),
-                ..default()
-            },
-            BackgroundColor(Color::srgba(0.07, 0.08, 0.11, 0.94)),
-            BorderColor(Color::srgb(0.28, 0.32, 0.40)),
-            BorderRadius::all(Val::Px(10.0)),
-            HoverPanel,
-        ))
-        .with_children(|panel| {
-            panel.spawn((
-                Text::new("TILE"),
-                label_style(11.0),
-                TextColor(muted),
-            ));
+fn spawn_hover_panel(commands: &mut Commands, theme: &UiTheme) {
+    spawn_framed_panel(
+        commands,
+        theme,
+        HudAnchor::BottomLeft {
+            left: 18.0,
+            bottom: 18.0,
+        },
+        268.0,
+        UiRect::new(Val::Px(18.0), Val::Px(16.0), Val::Px(16.0), Val::Px(18.0)),
+        12.0,
+        |panel, theme| {
+            panel.spawn((theme.label("TILE"), HoverPanel));
 
             panel
                 .spawn((
                     Node {
                         width: Val::Percent(100.0),
                         flex_direction: FlexDirection::Row,
-                        column_gap: Val::Px(12.0),
+                        column_gap: Val::Px(14.0),
                         align_items: AlignItems::Center,
                         ..default()
                     },
@@ -298,22 +289,30 @@ fn spawn_hover_panel(commands: &mut Commands) {
                 .with_children(|row| {
                     row.spawn((
                         Node {
-                            width: Val::Px(14.0),
-                            height: Val::Px(14.0),
+                            width: Val::Px(34.0),
+                            height: Val::Px(34.0),
+                            justify_content: JustifyContent::Center,
+                            align_items: AlignItems::Center,
                             border: UiRect::all(Val::Px(1.0)),
                             ..default()
                         },
-                        BackgroundColor(Color::srgb(0.35, 0.38, 0.45)),
-                        BorderColor(Color::srgba(1.0, 1.0, 1.0, 0.15)),
-                        BorderRadius::all(Val::Px(3.0)),
-                        HoverSwatch,
-                    ));
-                    row.spawn((
-                        Text::new("—"),
-                        label_style(20.0),
-                        TextColor(bright),
-                        HoverNameText,
-                    ));
+                        BackgroundColor(GEM_FRAME),
+                        BorderColor(GOLD),
+                    ))
+                    .with_children(|gem_frame| {
+                        gem_frame.spawn((
+                            Node {
+                                width: Val::Px(15.0),
+                                height: Val::Px(15.0),
+                                border: UiRect::all(Val::Px(1.0)),
+                                ..default()
+                            },
+                            BackgroundColor(Color::srgb(0.35, 0.38, 0.45)),
+                            BorderColor(Color::srgba(1.0, 0.95, 0.75, 0.45)),
+                            HoverSwatch,
+                        ));
+                    });
+                    row.spawn((theme.value("—", 26.0), HoverNameText));
                 });
 
             panel
@@ -321,63 +320,79 @@ fn spawn_hover_panel(commands: &mut Commands) {
                     Node {
                         width: Val::Percent(100.0),
                         flex_direction: FlexDirection::Column,
-                        row_gap: Val::Px(4.0),
+                        row_gap: Val::Px(5.0),
                         ..default()
                     },
                 ))
                 .with_children(|block| {
-                    block.spawn((
-                        Text::new("TYPE"),
-                        label_style(11.0),
-                        TextColor(muted),
-                    ));
-                    block.spawn((
-                        Text::new("—"),
-                        label_style(15.0),
-                        TextColor(accent),
-                        HoverCategoryText,
-                    ));
+                    block.spawn(theme.label("TYPE"));
+                    block.spawn((theme.value("—", 19.0), HoverCategoryText));
                 });
 
-            panel.spawn((
-                Node {
-                    width: Val::Percent(100.0),
-                    height: Val::Px(1.0),
-                    ..default()
-                },
-                BackgroundColor(Color::srgba(1.0, 1.0, 1.0, 0.08)),
-            ));
+            spawn_ornate_divider(panel, theme);
 
             panel
                 .spawn((
                     Node {
                         width: Val::Percent(100.0),
                         flex_direction: FlexDirection::Column,
-                        row_gap: Val::Px(4.0),
+                        row_gap: Val::Px(5.0),
                         ..default()
                     },
                 ))
                 .with_children(|block| {
-                    block.spawn((
-                        Text::new("COORDINATES"),
-                        label_style(11.0),
-                        TextColor(muted),
-                    ));
-                    block.spawn((
-                        Text::new("q —  ·  r —"),
-                        label_style(14.0),
-                        TextColor(Color::srgb(0.78, 0.81, 0.86)),
-                        HoverCoordsText,
-                    ));
+                    block.spawn(theme.label("COORDINATES"));
+                    block
+                        .spawn((
+                            Node {
+                                flex_direction: FlexDirection::Row,
+                                align_items: AlignItems::Center,
+                                column_gap: Val::Px(6.0),
+                                ..default()
+                            },
+                        ))
+                        .with_children(|row| {
+                            row.spawn((theme.value("q —", 16.0), HoverCoordsQ));
+                            row.spawn(theme.star(13.0));
+                            row.spawn((theme.value("r —", 16.0), HoverCoordsR));
+                        });
                 });
 
             panel.spawn((
-                Text::new("Move cursor over a hex"),
-                label_style(12.0),
-                TextColor(Color::srgb(0.42, 0.45, 0.52)),
+                theme.hint("Move cursor over a hex", 11.0),
                 HoverEmptyHint,
             ));
-        });
+
+            panel
+                .spawn((
+                    Node {
+                        position_type: PositionType::Absolute,
+                        right: Val::Px(10.0),
+                        bottom: Val::Px(8.0),
+                        ..default()
+                    },
+                ))
+                .with_children(|mark| {
+                    spawn_star_watermark(mark, theme);
+                });
+        },
+    );
+}
+
+fn format_hover_coord_half(axis: &str, value: Option<i32>) -> String {
+    let vs = value
+        .map(|v| v.to_string())
+        .unwrap_or_else(|| "—".to_string());
+    format!("{axis} {vs}")
+}
+
+fn terrain_swatch_color(t: TerrainType) -> Color {
+    let c = terrain_to_color(t).to_srgba();
+    Color::srgb(
+        (c.red * 1.12 + 0.06).min(1.0),
+        (c.green * 1.12 + 0.06).min(1.0),
+        (c.blue * 1.12 + 0.06).min(1.0),
+    )
 }
 
 fn default_save_path() -> String {
@@ -461,10 +476,10 @@ fn load_game(
     game_map.0 = map;
 
     if let Ok(mut text) = text_queries.p0().get_single_mut() {
-        text.0 = format!("Turn: {}", gs.turn);
+        text.0 = gs.turn.to_string();
     }
     if let Ok(mut text) = text_queries.p1().get_single_mut() {
-        text.0 = format!("Seed: {} (R to reroll)", data.seed);
+        text.0 = data.seed.to_string();
     }
     println!("Loaded game from: {path}");
 }
@@ -791,22 +806,22 @@ fn move_selected_unit(
 
 // ── FPS counter ─────────────────────────────────────────────────
 
-fn fps_startup(mut commands: Commands) {
-    commands.spawn((
-        Text::new("FPS: --"),
-        TextFont {
-            font_size: 16.0,
-            ..default()
+fn fps_startup(mut commands: Commands, theme: Res<UiTheme>) {
+    spawn_framed_panel(
+        &mut commands,
+        &theme,
+        HudAnchor::TopLeft {
+            left: 18.0,
+            top: 18.0,
         },
-        TextColor(Color::srgb(0.0, 1.0, 0.0)),
-        Node {
-            position_type: PositionType::Absolute,
-            left: Val::Px(10.0),
-            top: Val::Px(10.0),
-            ..default()
+        132.0,
+        UiRect::new(Val::Px(14.0), Val::Px(12.0), Val::Px(12.0), Val::Px(14.0)),
+        6.0,
+        |panel, theme| {
+            panel.spawn(theme.label("STATUS"));
+            panel.spawn((theme.value("—", 20.0), FpsText));
         },
-        FpsText,
-    ));
+    );
 }
 
 fn fps_update(
@@ -819,7 +834,7 @@ fn fps_update(
     if fps.elapsed >= 0.5 {
         let val = fps.frames as f32 / fps.elapsed;
         if let Ok(mut text) = query.get_single_mut() {
-            text.0 = format!("FPS: {:.0}", val);
+            text.0 = format!("{:.0} FPS", val);
         }
         fps.elapsed = 0.0;
         fps.frames = 0;
@@ -828,7 +843,7 @@ fn fps_update(
 
 // ── Settings Menu ───────────────────────────────────────────────
 
-fn spawn_menu(mut commands: Commands) {
+fn spawn_menu(mut commands: Commands, theme: Res<UiTheme>) {
     commands
         .spawn((
             Node {
@@ -840,44 +855,56 @@ fn spawn_menu(mut commands: Commands) {
                 display: Display::None,
                 justify_content: JustifyContent::Center,
                 align_items: AlignItems::Center,
-                flex_direction: FlexDirection::Column,
-                row_gap: Val::Px(12.0),
                 ..default()
             },
-            BackgroundColor(Color::srgba(0.0, 0.0, 0.0, 0.6)),
+            BackgroundColor(Color::srgba(0.02, 0.02, 0.03, 0.72)),
             MenuRoot,
         ))
-        .with_children(|parent| {
-            parent.spawn((
-                Text::new("SETTINGS"),
-                TextFont { font_size: 28.0, ..default() },
-                TextColor(Color::srgb(0.9, 0.9, 0.9)),
-            ));
-            // Toggle button
-            parent
+        .with_children(|overlay| {
+            overlay
                 .spawn((
-                    Button,
                     Node {
-                        padding: UiRect::all(Val::Px(8.0)),
-                        justify_content: JustifyContent::Center,
-                        align_items: AlignItems::Center,
+                        padding: UiRect::all(Val::Px(3.0)),
+                        border: UiRect::all(Val::Px(2.0)),
                         ..default()
                     },
-                    BackgroundColor(Color::srgb(0.2, 0.2, 0.3)),
-                    GridToggle,
+                    BackgroundColor(PARCHMENT),
+                    BorderColor(GOLD),
                 ))
-                .with_children(|btn| {
-                    btn.spawn((
-                        Text::new("Grid: OFF"),
-                        TextFont { font_size: 20.0, ..default() },
-                        TextColor(Color::srgb(0.8, 0.8, 0.8)),
-                    ));
+                .with_children(|frame| {
+                    frame
+                        .spawn((
+                            Node {
+                                width: Val::Px(320.0),
+                                flex_direction: FlexDirection::Column,
+                                padding: UiRect::new(
+                                    Val::Px(22.0),
+                                    Val::Px(20.0),
+                                    Val::Px(20.0),
+                                    Val::Px(22.0),
+                                ),
+                                row_gap: Val::Px(16.0),
+                                align_items: AlignItems::Center,
+                                border: UiRect::all(Val::Px(1.0)),
+                                ..default()
+                            },
+                            BackgroundColor(ui::PANEL),
+                            BorderColor(GOLD_DIM),
+                        ))
+                        .with_children(|panel| {
+                            panel.spawn(theme.value("SETTINGS", 26.0));
+                            spawn_ornate_divider(panel, &theme);
+                            panel
+                                .spawn((menu_button_bundle(), GridToggle))
+                                .with_children(|btn| {
+                                    btn.spawn((
+                                        theme.value("Grid: OFF", 17.0),
+                                        GridToggleLabel,
+                                    ));
+                                });
+                            panel.spawn(theme.hint("ESC — Close menu", 12.0));
+                        });
                 });
-            parent.spawn((
-                Text::new("ESC - Close"),
-                TextFont { font_size: 16.0, ..default() },
-                TextColor(Color::srgb(0.6, 0.6, 0.6)),
-            ));
         });
 }
 
@@ -926,7 +953,7 @@ fn handle_toggle_button(
     >,
     mut grid_visible: ResMut<GridVisible>,
     mut grid_query: Query<&mut Visibility, With<GridMarker>>,
-    mut text_query: Query<&mut Text>,
+    mut text_query: Query<&mut Text, With<GridToggleLabel>>,
 ) {
     for (interaction, mut bg, children) in &mut interaction_query {
         match *interaction {
@@ -939,7 +966,7 @@ fn handle_toggle_button(
                         Visibility::Hidden
                     };
                 }
-                bg.0 = Color::srgb(0.3, 0.3, 0.5);
+                bg.0 = BTN_PRESSED;
                 for &child in children.iter() {
                     if let Ok(mut text) = text_query.get_mut(child) {
                         text.0 = if grid_visible.0 {
@@ -951,10 +978,10 @@ fn handle_toggle_button(
                 }
             }
             Interaction::Hovered => {
-                bg.0 = Color::srgb(0.3, 0.3, 0.4);
+                bg.0 = BTN_HOVER;
             }
             Interaction::None => {
-                bg.0 = Color::srgb(0.2, 0.2, 0.3);
+                bg.0 = BTN_IDLE;
             }
         }
     }
@@ -963,9 +990,12 @@ fn handle_toggle_button(
 fn update_hover_panel(
     hovered: Res<HoveredHex>,
     map: Res<GameMap>,
-    mut name: Query<&mut Text, (With<HoverNameText>, Without<HoverCategoryText>)>,
-    mut category: Query<&mut Text, (With<HoverCategoryText>, Without<HoverNameText>)>,
-    mut coords: Query<&mut Text, With<HoverCoordsText>>,
+    mut texts: ParamSet<(
+        Query<&mut Text, With<HoverNameText>>,
+        Query<&mut Text, With<HoverCategoryText>>,
+        Query<&mut Text, With<HoverCoordsQ>>,
+        Query<&mut Text, With<HoverCoordsR>>,
+    )>,
     mut swatch: Query<&mut BackgroundColor, With<HoverSwatch>>,
     mut hint: Query<&mut Visibility, With<HoverEmptyHint>>,
     mut prev: Local<Option<HexCoord>>,
@@ -975,15 +1005,6 @@ fn update_hover_panel(
     }
     *prev = hovered.0;
 
-    let Ok(mut name) = name.get_single_mut() else {
-        return;
-    };
-    let Ok(mut category) = category.get_single_mut() else {
-        return;
-    };
-    let Ok(mut coords) = coords.get_single_mut() else {
-        return;
-    };
     let Ok(mut swatch) = swatch.get_single_mut() else {
         return;
     };
@@ -991,31 +1012,56 @@ fn update_hover_panel(
         return;
     };
 
-    let Some(coord) = hovered.0 else {
-        *hint = Visibility::Visible;
-        name.0 = "—".to_string();
-        category.0 = "—".to_string();
-        coords.0 = "q —  ·  r —".to_string();
-        swatch.0 = Color::srgb(0.35, 0.38, 0.45);
-        return;
+    let (name, category, q_coord, r_coord, color, show_hint) = match hovered.0 {
+        None => (
+            "—".to_string(),
+            "—".to_string(),
+            format_hover_coord_half("q", None),
+            format_hover_coord_half("r", None),
+            Color::srgb(0.35, 0.38, 0.45),
+            true,
+        ),
+        Some(coord) => match map.0.tile_at(coord) {
+            None => (
+                "Out of map".to_string(),
+                "—".to_string(),
+                format_hover_coord_half("q", Some(coord.q)),
+                format_hover_coord_half("r", Some(coord.r)),
+                Color::srgb(0.35, 0.38, 0.45),
+                false,
+            ),
+            Some(tile) => (
+                terrain_label(tile.terrain).to_string(),
+                terrain_category(tile.terrain)
+                    .map(str::to_string)
+                    .unwrap_or_else(|| "Other".to_string()),
+                format_hover_coord_half("q", Some(coord.q)),
+                format_hover_coord_half("r", Some(coord.r)),
+                terrain_swatch_color(tile.terrain),
+                false,
+            ),
+        },
     };
 
-    *hint = Visibility::Hidden;
-
-    let Some(tile) = map.0.tile_at(coord) else {
-        name.0 = "Out of map".to_string();
-        category.0 = "—".to_string();
-        coords.0 = format!("q {}  ·  r {}", coord.q, coord.r);
-        swatch.0 = Color::srgb(0.35, 0.38, 0.45);
-        return;
+    *hint = if show_hint {
+        Visibility::Visible
+    } else {
+        Visibility::Hidden
     };
+    swatch.0 = color;
 
-    name.0 = terrain_label(tile.terrain).to_string();
-    category.0 = terrain_category(tile.terrain)
-        .map(str::to_string)
-        .unwrap_or_else(|| "Other".to_string());
-    coords.0 = format!("q {}  ·  r {}", coord.q, coord.r);
-    swatch.0 = terrain_to_color(tile.terrain);
+    if let Ok(mut text) = texts.p0().get_single_mut() {
+        text.0 = name;
+    }
+    if let Ok(mut text) = texts.p1().get_single_mut() {
+        text.0 = category;
+    }
+    if let Ok(mut text) = texts.p2().get_single_mut() {
+        text.0 = q_coord;
+    }
+    if let Ok(mut text) = texts.p3().get_single_mut() {
+        text.0 = r_coord;
+    }
 }
 
 fn terrain_label(t: TerrainType) -> &'static str {
@@ -1076,7 +1122,7 @@ fn end_turn(
     }
     gs.next_turn(&map.0);
     if let Ok(mut text) = query.get_single_mut() {
-        text.0 = format!("Turn: {}", gs.turn);
+        text.0 = gs.turn.to_string();
     }
 }
 
@@ -1116,9 +1162,9 @@ fn reroll_world(
     hovered.0 = None;
 
     if let Ok(mut text) = text_queries.p0().get_single_mut() {
-        text.0 = "Turn: 1".to_string();
+        text.0 = "1".to_string();
     }
     if let Ok(mut text) = text_queries.p1().get_single_mut() {
-        text.0 = format!("Seed: {seed} (R to reroll)");
+        text.0 = seed.to_string();
     }
 }
