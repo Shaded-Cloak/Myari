@@ -1,19 +1,22 @@
 mod game;
 mod hexgrid;
 mod map;
+mod outer_islands;
+mod rng;
 
 use bevy::color::Color;
 use bevy::input::keyboard::KeyCode;
-use bevy::input::mouse::{MouseButton, MouseWheel};
+use bevy::input::mouse::MouseButton;
 use bevy::prelude::*;
 use bevy::render::mesh::Indices;
 use bevy::render::render_resource::PrimitiveTopology;
 use bevy::window::{MonitorSelection, PrimaryWindow, WindowMode};
+use bevy_pancam::{PanCam, PanCamPlugin};
 use rand::Rng;
 use std::collections::HashSet;
 
 use game::GameState;
-use hexgrid::{axial_to_pixel, pixel_to_hex, HexCoord};
+use crate::hexgrid::{axial_to_pixel, hex_corners_at, hex_corners_local, pixel_to_hex, HexCoord};
 use map::{Map, HexTile, TerrainType, MAP_RADIUS};
 
 const HEX_SIZE: f32 = 28.0;
@@ -29,7 +32,7 @@ fn main() {
             }),
             ..default()
         }))
-        .init_resource::<CameraState>()
+        .add_plugins(PanCamPlugin)
         .init_resource::<SelectedHex>()
         .init_resource::<HoveredHex>()
         .init_resource::<FpsCounter>()
@@ -42,8 +45,8 @@ fn main() {
         .add_systems(
             Update,
             (
-                pan_camera,
-                zoom_camera,
+                sync_pancam,
+                sync_zoom_from_camera,
                 track_hover,
                 highlight_hover,
                 update_hover_tile_text,
@@ -64,18 +67,13 @@ fn main() {
 // ── Resources ───────────────────────────────────────────────────
 
 #[derive(Resource, Default)]
-struct CameraState {
-    dragging: bool,
-}
+struct SelectedHex(Option<HexCoord>);
 
 #[derive(Resource)]
 struct GameMap(Map);
 
 #[derive(Resource, Default)]
 struct CurrentSeed(u64);
-
-#[derive(Resource, Default)]
-struct SelectedHex(Option<HexCoord>);
 
 #[derive(Resource, Default)]
 struct HoveredHex(Option<HexCoord>);
@@ -146,7 +144,31 @@ struct SavePath(Option<String>);
 // ── Startup ─────────────────────────────────────────────────────
 
 fn setup_camera(mut commands: Commands) {
-    commands.spawn(Camera2d);
+    commands.spawn((
+        Camera2d,
+        PanCam {
+            grab_buttons: vec![MouseButton::Left, MouseButton::Middle],
+            zoom_to_cursor: true,
+            min_scale: 0.02,
+            max_scale: 60.0,
+            ..default()
+        },
+    ));
+}
+
+fn sync_pancam(menu: Res<MenuOpen>, mut cameras: Query<&mut PanCam>) {
+    if let Ok(mut pan) = cameras.get_single_mut() {
+        pan.enabled = !menu.0;
+    }
+}
+
+fn sync_zoom_from_camera(
+    mut zoom: ResMut<Zoom>,
+    cameras: Query<&OrthographicProjection, With<Camera2d>>,
+) {
+    if let Ok(proj) = cameras.get_single() {
+        zoom.0 = proj.scale;
+    }
 }
 
 fn spawn_map_and_game(
@@ -238,6 +260,7 @@ fn default_save_path() -> String {
 #[derive(serde::Serialize, serde::Deserialize)]
 struct SaveData {
     seed: u64,
+    tiles: Vec<HexTile>,
     game_state: GameState,
 }
 
@@ -246,6 +269,7 @@ fn save_game(
     save_path: Res<SavePath>,
     seed: Res<CurrentSeed>,
     gs: Res<GameState>,
+    map: Res<GameMap>,
 ) {
     if !keys.just_pressed(KeyCode::F5) {
         return;
@@ -255,6 +279,7 @@ fn save_game(
     };
     let data = SaveData {
         seed: seed.0,
+        tiles: map.0.tiles.clone(),
         game_state: gs.clone(),
     };
     let Ok(text) = serde_json::to_string_pretty(&data) else {
@@ -300,37 +325,10 @@ fn load_game(
     }
 
     seed_res.0 = data.seed;
-    let (map, _new_gs) = spawn_world_entities(&mut commands, &mut meshes, &mut materials, data.seed);
-    game_map.0 = map;
+    let map = Map::from_tiles(data.tiles);
     *gs = data.game_state;
-
-    // Re-draw cities/units based on loaded state (and same map).
-    for (civ_idx, civ) in gs.civs.iter().enumerate() {
-        let color = Color::srgb(
-            civ.color.0 as f32 / 255.0,
-            civ.color.1 as f32 / 255.0,
-            civ.color.2 as f32 / 255.0,
-        );
-        for city in &civ.cities {
-            let (cx, cy) = axial_to_pixel(city.coord.q, city.coord.r, HEX_SIZE);
-            commands.spawn((
-                Mesh2d(meshes.add(Circle::new(10.0))),
-                MeshMaterial2d(materials.add(ColorMaterial::from_color(color))),
-                Transform::from_xyz(cx, cy, 3.0),
-                WorldEntity,
-            ));
-        }
-        for (unit_idx, unit) in civ.units.iter().enumerate() {
-            let (ux, uy) = axial_to_pixel(unit.coord.q, unit.coord.r, HEX_SIZE);
-            commands.spawn((
-                Mesh2d(meshes.add(Circle::new(5.0))),
-                MeshMaterial2d(materials.add(ColorMaterial::from_color(color))),
-                Transform::from_xyz(ux, uy, 3.0),
-                UnitMarker { civ_idx, unit_idx },
-                WorldEntity,
-            ));
-        }
-    }
+    spawn_world_visuals(&mut commands, &mut meshes, &mut materials, &map, &gs);
+    game_map.0 = map;
 
     if let Ok(mut text) = text_queries.p0().get_single_mut() {
         text.0 = format!("Turn: {}", gs.turn);
@@ -341,15 +339,13 @@ fn load_game(
     println!("Loaded game from: {path}");
 }
 
-fn spawn_world_entities(
+fn spawn_world_visuals(
     commands: &mut Commands,
     meshes: &mut ResMut<Assets<Mesh>>,
     materials: &mut ResMut<Assets<ColorMaterial>>,
-    seed: u64,
-) -> (Map, GameState) {
-    let map = Map::generate(MAP_RADIUS, seed);
-    let gs = GameState::new(&map);
-
+    map: &Map,
+    gs: &GameState,
+) {
     let map_mesh = meshes.add(make_combined_hex_mesh(&map.tiles, HEX_SIZE));
     commands.spawn((
         Mesh2d(map_mesh),
@@ -371,6 +367,15 @@ fn spawn_world_entities(
         WorldEntity,
     ));
 
+    spawn_civ_markers(commands, meshes, materials, gs);
+}
+
+fn spawn_civ_markers(
+    commands: &mut Commands,
+    meshes: &mut ResMut<Assets<Mesh>>,
+    materials: &mut ResMut<Assets<ColorMaterial>>,
+    gs: &GameState,
+) {
     for (civ_idx, civ) in gs.civs.iter().enumerate() {
         let color = Color::srgb(
             civ.color.0 as f32 / 255.0,
@@ -397,7 +402,17 @@ fn spawn_world_entities(
             ));
         }
     }
+}
 
+fn spawn_world_entities(
+    commands: &mut Commands,
+    meshes: &mut ResMut<Assets<Mesh>>,
+    materials: &mut ResMut<Assets<ColorMaterial>>,
+    seed: u64,
+) -> (Map, GameState) {
+    let map = Map::generate(MAP_RADIUS, seed);
+    let gs = GameState::new(&map);
+    spawn_world_visuals(commands, meshes, materials, &map, &gs);
     (map, gs)
 }
 
@@ -405,10 +420,8 @@ fn spawn_world_entities(
 
 fn make_hex_mesh(size: f32) -> Mesh {
     let mut positions = vec![[0.0, 0.0, 0.0]];
-    for i in 0..6 {
-        let angle_deg = 60.0 * i as f32 - 30.0;
-        let angle_rad = angle_deg.to_radians();
-        positions.push([size * angle_rad.cos(), size * angle_rad.sin(), 0.0]);
+    for &(x, y) in &hex_corners_local(size) {
+        positions.push([x, y, 0.0]);
     }
     let mut indices = Vec::new();
     for i in 0..6 {
@@ -423,13 +436,12 @@ fn make_hex_mesh(size: f32) -> Mesh {
 }
 
 fn make_hex_outline_mesh(size: f32) -> Mesh {
-    let mut positions = Vec::new();
-    for i in 0..6 {
-        let angle_deg = 60.0 * i as f32 - 30.0;
-        let angle_rad = angle_deg.to_radians();
-        positions.push([size * angle_rad.cos(), size * angle_rad.sin(), 0.0]);
-    }
-    let indices: Vec<u32> = vec![0, 1, 2, 3, 4, 5, 0];
+    let mut positions: Vec<[f32; 3]> = hex_corners_local(size)
+        .iter()
+        .map(|&(x, y)| [x, y, 0.0])
+        .collect();
+    positions.push(positions[0]);
+    let indices: Vec<u32> = (0..positions.len() as u32).collect();
     let mut mesh = Mesh::new(PrimitiveTopology::LineStrip, Default::default());
     mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, positions);
     mesh.insert_indices(Indices::U32(indices));
@@ -446,15 +458,11 @@ fn make_combined_hex_mesh(tiles: &[HexTile], size: f32) -> Mesh {
         let (cx, cy) = axial_to_pixel(tile.coord.q, tile.coord.r, size);
         let c = terrain_to_color(tile.terrain).to_linear().to_f32_array();
 
-        // Center
         positions.push([cx, cy, 0.0]);
         colors.push(c);
 
-        // 6 corners
-        for i in 0..6 {
-            let angle_deg = 60.0 * i as f32 - 30.0;
-            let angle_rad = angle_deg.to_radians();
-            positions.push([cx + size * angle_rad.cos(), cy + size * angle_rad.sin(), 0.0]);
+        for &(x, y) in &hex_corners_at(tile.coord.q, tile.coord.r, size) {
+            positions.push([x, y, 0.0]);
             colors.push(c);
         }
 
@@ -484,12 +492,9 @@ fn make_grid_mesh(tiles: &[HexTile], size: f32) -> Mesh {
         if aa <= bb { (aa, bb) } else { (bb, aa) }
     };
     for tile in tiles {
-        let (cx, cy) = axial_to_pixel(tile.coord.q, tile.coord.r, size);
         let mut corners: [[f32; 3]; 6] = [[0.0; 3]; 6];
-        for i in 0..6 {
-            let angle_deg = 60.0 * i as f32 - 30.0;
-            let angle_rad = angle_deg.to_radians();
-            corners[i] = [cx + size * angle_rad.cos(), cy + size * angle_rad.sin(), 0.0];
+        for (i, &(x, y)) in hex_corners_at(tile.coord.q, tile.coord.r, size).iter().enumerate() {
+            corners[i] = [x, y, 0.0];
         }
         let neighbors = tile.coord.neighbors();
         for i in 0..6 {
@@ -518,6 +523,9 @@ fn terrain_to_color(t: TerrainType) -> Color {
         TerrainType::Hills => Color::srgb_u8(0x7a, 0x6a, 0x4a),
         TerrainType::Mountain => Color::srgb_u8(0x5a, 0x5a, 0x5a),
         TerrainType::SnowPeak => Color::srgb_u8(0xdc, 0xe8, 0xf0),
+        TerrainType::StonySlope => Color::srgb_u8(0x7a, 0x68, 0x58),
+        TerrainType::AridPeak => Color::srgb_u8(0xb0, 0x78, 0x40),
+        TerrainType::GlacialPeak => Color::srgb_u8(0xa8, 0xd8, 0xf0),
         TerrainType::Ashplain => Color::srgb_u8(0xb0, 0x9a, 0x6a),
         TerrainType::Thornveld => Color::srgb_u8(0x8a, 0x78, 0x30),
         TerrainType::Deepjungle => Color::srgb_u8(0x1a, 0x5c, 0x28),
@@ -538,62 +546,7 @@ fn terrain_to_color(t: TerrainType) -> Color {
     }
 }
 
-// ── Camera: Pan ─────────────────────────────────────────────────
-
-fn pan_camera(
-    mut state: ResMut<CameraState>,
-    mouse: Res<ButtonInput<MouseButton>>,
-    mut cursor_evr: EventReader<CursorMoved>,
-    mut query: Query<&mut Transform, With<Camera2d>>,
-    menu_open: Res<MenuOpen>,
-    zoom: Res<Zoom>,
-) {
-    if menu_open.0 {
-        return;
-    }
-    let mut cam_transform = query.single_mut();
-
-    if mouse.just_pressed(MouseButton::Left) {
-        state.dragging = true;
-    }
-    if mouse.just_released(MouseButton::Left) {
-        state.dragging = false;
-    }
-    if !state.dragging {
-        return;
-    }
-
-    for ev in cursor_evr.read() {
-        if let Some(delta) = ev.delta {
-            cam_transform.translation.x -= delta.x * zoom.0;
-            cam_transform.translation.y += delta.y * zoom.0;
-        }
-    }
-}
-
-// ── Camera: Zoom ────────────────────────────────────────────────
-
-fn zoom_camera(
-    mut scroll_evr: EventReader<MouseWheel>,
-    mut query: Query<&mut OrthographicProjection, With<Camera2d>>,
-    mut zoom: ResMut<Zoom>,
-    menu_open: Res<MenuOpen>,
-) {
-    if menu_open.0 {
-        return;
-    }
-    let mut proj = query.single_mut();
-    for ev in scroll_evr.read() {
-        let zoom_factor = 1.0 + ev.y.abs() * 0.2;
-        if ev.y > 0.0 {
-            proj.scale /= zoom_factor;
-        } else {
-            proj.scale *= zoom_factor;
-        }
-        proj.scale = proj.scale.clamp(0.02, 60.0);
-        zoom.0 = proj.scale;
-    }
-}
+// ── Hover (cheap: single entity, no material mutation) ──────────
 
 fn screen_to_world(cam: &Transform, window_size: Vec2, screen_pos: Vec2, zoom: f32) -> Vec2 {
     let ndc = Vec2::new(
@@ -602,8 +555,6 @@ fn screen_to_world(cam: &Transform, window_size: Vec2, screen_pos: Vec2, zoom: f
     );
     cam.translation.truncate() + ndc * window_size * 0.5 * zoom
 }
-
-// ── Hover (cheap: single entity, no material mutation) ──────────
 
 fn track_hover(
     window: Query<&Window, With<PrimaryWindow>>,
@@ -883,6 +834,9 @@ fn terrain_label(t: TerrainType) -> &'static str {
         TerrainType::Hills => "Hills",
         TerrainType::Mountain => "Mountain",
         TerrainType::SnowPeak => "Snow Peak",
+        TerrainType::StonySlope => "Stony Slope",
+        TerrainType::AridPeak => "Arid Peak",
+        TerrainType::GlacialPeak => "Glacial Peak",
         TerrainType::Ashplain => "Ashplain",
         TerrainType::Thornveld => "Thornveld",
         TerrainType::Deepjungle => "Deepjungle",

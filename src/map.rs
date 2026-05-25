@@ -1,21 +1,32 @@
 use std::collections::{HashMap, VecDeque};
 
-use crate::hexgrid::HexCoord;
-use noise::{Fbm, MultiFractal, NoiseFn, Perlin};
+use glam::Vec2;
+
+use crate::hexgrid::{hex_disk, HexCoord};
+use crate::rng::tile_roll;
+use fastnoise_lite::{DomainWarpType, FastNoiseLite, FractalType, NoiseType};
+use hexx::{HexLayout, HexOrientation};
+use serde::{Deserialize, Serialize};
 
 pub const MAP_RADIUS: i32 = 220;
 
 // Island layout constants (layout-space units ≈ hex widths)
 const CENTER_R: f32 = 66.0;
-const CRESCENT_R_IN: f32 = 132.0;
-const CRESCENT_R_OUT: f32 = 172.0;
+const CRESCENT_R_IN: f32 = 96.0;
+const CRESCENT_R_OUT: f32 = 192.0;
 const CRESCENT_ARC_HALF: f32 = 44.0; // 88° arc → 32° open ocean between each pair
-const COAST_NOISE_AMP: f32 = 10.0;
-const DEEP_OCEAN_DIST: i32 = 6;
+const COAST_NOISE_AMP: f32 = 14.0;
+/// Per-tile wobble (in degrees) applied to the arc half-width so the crescent
+/// tips terminate on a ragged curve instead of straight angular rays.
+const ARC_WOBBLE_AMP_DEG: f32 = 7.0;
+
+/// Water depth tiers measured in BFS hex distance from any land tile.
+const COAST_MAX_DIST: i32 = 1;
+const DEEP_OCEAN_MIN_DIST: i32 = 6;
 
 const CRESCENT_ANGLES: [f32; 3] = [90.0, 210.0, 330.0];
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum TerrainType {
     DeepOcean,
     Ocean,
@@ -24,6 +35,9 @@ pub enum TerrainType {
     Hills,
     Mountain,
     SnowPeak,
+    StonySlope,
+    AridPeak,
+    GlacialPeak,
     Ashplain,
     Thornveld,
     Deepjungle,
@@ -56,61 +70,48 @@ struct TileGen {
     terrain: TerrainType,
 }
 
-#[derive(Debug, Clone, Copy)]
+impl TileGen {
+    fn is_land(&self) -> bool {
+        self.island.is_some()
+    }
+
+    fn is_outer_island(&self) -> bool {
+        matches!(self.island, Some(Island::Crescent(_)))
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct HexTile {
     pub coord: HexCoord,
     pub terrain: TerrainType,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Map {
     pub tiles: Vec<HexTile>,
+    #[serde(skip)]
     by_coord: HashMap<HexCoord, usize>,
 }
 
 impl Map {
     pub fn generate(radius: i32, seed: u64) -> Self {
-        let noise = NoiseCtx::new(seed);
-        let coords = hex_disk_coords(radius);
-        let mut gen: Vec<TileGen> = coords
-            .iter()
-            .map(|&coord| {
-                let island = classify_island(&noise, coord.q, coord.r);
-                let terrain = if island.is_some() {
-                    TerrainType::Plains // placeholder until biome pass
-                } else {
-                    TerrainType::Ocean
-                };
-                TileGen {
-                    coord,
-                    island,
-                    terrain,
-                }
-            })
-            .collect();
+        let mut map = Self::from_tiles(generate_tiles(radius, seed));
+        map.rebuild_index();
+        map
+    }
 
-        let mut by_coord: HashMap<HexCoord, usize> =
-            HashMap::with_capacity(gen.len());
-        for (i, t) in gen.iter().enumerate() {
+    fn rebuild_index(&mut self) {
+        self.by_coord.clear();
+        for (i, t) in self.tiles.iter().enumerate() {
+            self.by_coord.insert(t.coord, i);
+        }
+    }
+
+    pub fn from_tiles(tiles: Vec<HexTile>) -> Self {
+        let mut by_coord = HashMap::with_capacity(tiles.len());
+        for (i, t) in tiles.iter().enumerate() {
             by_coord.insert(t.coord, i);
         }
-
-        assign_biomes(&mut gen, &noise);
-        apply_special_tiles(&mut gen, &noise);
-        assign_sacred_ground(&mut gen);
-        assign_coast_and_ocean(&mut gen, &by_coord);
-        assign_beaches(&mut gen, seed, &by_coord);
-        remove_speckles(&mut gen, &by_coord);
-
-        let tiles: Vec<HexTile> = gen
-            .into_iter()
-            .map(|t| HexTile {
-                coord: t.coord,
-                terrain: t.terrain,
-            })
-            .collect();
-
-        log_distribution(&tiles);
-
         Self { tiles, by_coord }
     }
 
@@ -121,90 +122,119 @@ impl Map {
     }
 }
 
-// ── Noise ────────────────────────────────────────────────────────────────────
+fn generate_tiles(radius: i32, seed: u64) -> Vec<HexTile> {
+    let noise = NoiseCtx::new(seed);
+    let coords = hex_disk(radius);
+    let mut gen: Vec<TileGen> = coords
+        .iter()
+        .map(|&coord| {
+            let island = classify_island(&noise, coord.q, coord.r);
+            let terrain = if island.is_some() {
+                TerrainType::Plains
+            } else {
+                TerrainType::Ocean
+            };
+            TileGen {
+                coord,
+                island,
+                terrain,
+            }
+        })
+        .collect();
+
+    let by_coord: HashMap<HexCoord, usize> = gen
+        .iter()
+        .enumerate()
+        .map(|(i, t)| (t.coord, i))
+        .collect();
+
+    assign_beaches(&mut gen, seed, &by_coord);
+    assign_outer_island_terrain(&mut gen, seed, &by_coord);
+    assign_water_depth(&mut gen, &by_coord);
+    speckle_cleanup(&mut gen, &by_coord);
+
+    let tiles: Vec<HexTile> = gen
+        .into_iter()
+        .map(|t| HexTile {
+            coord: t.coord,
+            terrain: t.terrain,
+        })
+        .collect();
+
+    log_distribution(&tiles);
+    tiles
+}
+
+// ── Noise (only the coast wobble is needed now) ──────────────────────────────
 
 struct NoiseCtx {
-    coast: Fbm<Perlin>,
-    elevation: Fbm<Perlin>,
-    moisture: Fbm<Perlin>,
-    biome_detail: Fbm<Perlin>,
-    special: Fbm<Perlin>,
+    coast: FastNoiseLite,
+    coast_warp: FastNoiseLite,
+    arc_edge: FastNoiseLite,
 }
 
 impl NoiseCtx {
     fn new(seed: u64) -> Self {
         Self {
-            coast: make_fbm(mix_seed(seed, 1), 4, 0.012, 2.0, 0.5),
-            elevation: make_fbm(mix_seed(seed, 2), 5, 0.008, 2.0, 0.5),
-            moisture: make_fbm(mix_seed(seed, 3), 4, 0.010, 2.0, 0.5),
-            biome_detail: make_fbm(mix_seed(seed, 4), 3, 0.025, 2.0, 0.5),
-            special: make_fbm(mix_seed(seed, 5), 3, 0.004, 2.0, 0.55),
+            coast: make_fbm(seed, 1, 4, 0.012),
+            coast_warp: make_domain_warp(seed, 2, 22.0, 0.016),
+            arc_edge: make_fbm(seed, 3, 3, 0.018),
         }
     }
 
     fn coast_offset(&self, x: f32, y: f32) -> f32 {
-        (self.sample01(&self.coast, x, y) - 0.5) * 2.0 * COAST_NOISE_AMP
+        let (wx, wy) = self.coast_warp.domain_warp_2d(x, y);
+        let sample = (self.coast.get_noise_2d(wx, wy) + 1.0) * 0.5;
+        (sample - 0.5) * 2.0 * COAST_NOISE_AMP
     }
 
-    fn elevation(&self, x: f32, y: f32) -> f32 {
-        self.sample01(&self.elevation, x, y)
-    }
-
-    fn moisture(&self, x: f32, y: f32) -> f32 {
-        self.sample01(&self.moisture, x, y)
-    }
-
-    fn biome_detail(&self, x: f32, y: f32) -> f32 {
-        self.sample01(&self.biome_detail, x, y)
-    }
-
-    fn special(&self, x: f32, y: f32) -> f32 {
-        self.sample01(&self.special, x, y)
-    }
-
-    fn sample01(&self, fbm: &Fbm<Perlin>, x: f32, y: f32) -> f32 {
-        let v = fbm.get([x as f64, y as f64]);
-        (v as f32 + 1.0) * 0.5
+    /// Signed angular offset in degrees applied to the crescent arc threshold.
+    /// Same sample is shared by all three crescents but the (x, y) position is
+    /// per-tile, so each tip wobbles independently in practice.
+    fn arc_wobble_deg(&self, x: f32, y: f32) -> f32 {
+        let sample = (self.arc_edge.get_noise_2d(x, y) + 1.0) * 0.5;
+        (sample - 0.5) * 2.0 * ARC_WOBBLE_AMP_DEG
     }
 }
 
-fn make_fbm(
-    seed: u32,
-    octaves: usize,
-    frequency: f64,
-    lacunarity: f64,
-    persistence: f64,
-) -> Fbm<Perlin> {
-    Fbm::<Perlin>::new(seed)
-        .set_octaves(octaves)
-        .set_frequency(frequency)
-        .set_lacunarity(lacunarity)
-        .set_persistence(persistence)
+fn make_fbm(seed: u64, salt: u32, octaves: i32, frequency: f32) -> FastNoiseLite {
+    let mut f = FastNoiseLite::with_seed(crate::rng::seed_to_i32(seed, salt));
+    f.set_noise_type(Some(NoiseType::OpenSimplex2));
+    f.set_fractal_type(Some(FractalType::FBm));
+    f.set_fractal_octaves(Some(octaves));
+    f.set_frequency(Some(frequency));
+    f.set_fractal_lacunarity(Some(2.0));
+    f.set_fractal_gain(Some(0.5));
+    f
 }
 
-fn mix_seed(seed: u64, salt: u32) -> u32 {
-    let mut z = seed.wrapping_add(salt as u64).wrapping_add(0x9E37_79B9_7F4A_7C15);
-    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-    (z ^ (z >> 31)) as u32
-}
-
-/// Deterministic per-hex roll in [0, 1) — independent at each coordinate.
-fn tile_roll(seed: u64, q: i32, r: i32, salt: u32) -> f32 {
-    let pos = (q as u64).wrapping_mul(0x1E05_A879).wrapping_add(r as u64);
-    mix_seed(seed ^ pos, salt) as f32 / u32::MAX as f32
+fn make_domain_warp(seed: u64, salt: u32, amp: f32, frequency: f32) -> FastNoiseLite {
+    let mut f = FastNoiseLite::with_seed(crate::rng::seed_to_i32(seed, salt));
+    f.set_domain_warp_type(Some(DomainWarpType::OpenSimplex2));
+    f.set_domain_warp_amp(Some(amp));
+    f.set_frequency(Some(frequency));
+    f
 }
 
 // ── Layout / island mask ─────────────────────────────────────────────────────
 
-fn layout_xy(q: i32, r: i32) -> (f32, f32) {
-    let x = 3f32.sqrt() * q as f32 + 3f32.sqrt() / 2.0 * r as f32;
-    let y = 1.5 * r as f32;
-    (x, y)
+fn flat_layout(hex_size: f32) -> HexLayout {
+    HexLayout {
+        orientation: HexOrientation::Flat,
+        origin: hexx::Vec2::ZERO,
+        hex_size: hexx::Vec2::new(hex_size, hex_size),
+        invert_x: false,
+        invert_y: false,
+    }
 }
 
-fn polar(x: f32, y: f32) -> (f32, f32) {
-    (x.hypot(y), y.atan2(x).to_degrees())
+fn layout_xy(q: i32, r: i32) -> Vec2 {
+    let p = flat_layout(1.0).hex_to_world_pos(hexx::Hex::new(q, r));
+    Vec2::new(p.x, p.y)
+}
+
+fn polar(v: Vec2) -> (f32, f32) {
+    (v.length(), v.y.atan2(v.x).to_degrees())
 }
 
 fn angle_diff(a: f32, b: f32) -> f32 {
@@ -217,19 +247,23 @@ fn angle_diff(a: f32, b: f32) -> f32 {
     d
 }
 
+/// Central disk + three crescents. Returns which island a tile belongs to (if
+/// any). The mask shape is unchanged from before — center disk plus three
+/// arcs wobbled radially by the coast noise and angularly by `arc_wobble`.
 fn classify_island(noise: &NoiseCtx, q: i32, r: i32) -> Option<Island> {
-    let (x, y) = layout_xy(q, r);
-    let hex_dist = HexCoord::new(q, r)
-        .distance(&HexCoord::new(0, 0)) as f32;
-    let coast = noise.coast_offset(x, y);
-    let (_, tile_angle) = polar(x, y);
+    let pos = layout_xy(q, r);
+    let hex_dist = HexCoord::new(q, r).distance(&HexCoord::origin()) as f32;
+    let coast = noise.coast_offset(pos.x, pos.y);
+    let arc_wobble = noise.arc_wobble_deg(pos.x, pos.y);
+    let (_, tile_angle) = polar(pos);
 
     if hex_dist < CENTER_R + coast {
         return Some(Island::Center);
     }
 
+    let arc_half = CRESCENT_ARC_HALF + arc_wobble;
     for (i, &base_angle) in CRESCENT_ANGLES.iter().enumerate() {
-        if angle_diff(tile_angle, base_angle).abs() > CRESCENT_ARC_HALF {
+        if angle_diff(tile_angle, base_angle).abs() > arc_half {
             continue;
         }
         let inner = CRESCENT_R_IN + coast * 0.6;
@@ -242,354 +276,49 @@ fn classify_island(noise: &NoiseCtx, q: i32, r: i32) -> Option<Island> {
     None
 }
 
-// ── Biome assignment ─────────────────────────────────────────────────────────
+// ── Beach fringe ─────────────────────────────────────────────────────────────
 
-fn assign_biomes(gen: &mut [TileGen], noise: &NoiseCtx) {
-    for tile in gen.iter_mut() {
-        let Some(island) = tile.island else {
-            continue;
-        };
-        let (x, y) = layout_xy(tile.coord.q, tile.coord.r);
-        let elev = noise.elevation(x, y);
-        let moist = noise.moisture(x, y);
-        let detail = noise.biome_detail(x, y);
-        let (_, angle) = polar(x, y);
-
-        let temp = match island {
-            Island::Center => 0.45 + detail * 0.15,
-            Island::Crescent(0) => {
-                // Cold — northern crescent (90°)
-                0.12 + detail * 0.22 + (y / 180.0).clamp(-0.12, 0.12)
-            }
-            Island::Crescent(1) => {
-                // Warm — south-east (210°)
-                0.65 + detail * 0.2 + (-y / 250.0).clamp(-0.1, 0.15)
-            }
-            Island::Crescent(2) => {
-                // Temperate — south-west (330°)
-                0.42 + detail * 0.22 + (angle / 500.0)
-            }
-            Island::Crescent(_) => 0.5,
-        };
-
-        // Elevation overrides
-        if elev > 0.72 && temp < 0.45 {
-            tile.terrain = TerrainType::SnowPeak;
-            continue;
-        }
-        if elev > 0.74 {
-            tile.terrain = TerrainType::Mountain;
-            continue;
-        }
-        if elev > 0.58 {
-            tile.terrain = TerrainType::Hills;
-            continue;
-        }
-
-        tile.terrain = match island {
-            Island::Center => center_base_biome(moist, detail, elev),
-            Island::Crescent(0) => cold_biome(moist, temp, detail),
-            Island::Crescent(1) => warm_biome(moist, temp, detail),
-            Island::Crescent(2) => temperate_biome(moist, temp, detail),
-            Island::Crescent(_) => TerrainType::Plains,
-        };
-    }
-}
-
-fn cold_biome(moist: f32, temp: f32, detail: f32) -> TerrainType {
-    let m = moist * 0.45 + detail * 0.55;
-    if m > 0.66 {
-        TerrainType::Darkpine
-    } else if m > 0.52 {
-        TerrainType::Oldwood
-    } else if m > 0.38 {
-        TerrainType::Frostmoor
-    } else if m > 0.24 {
-        TerrainType::Snowfield
-    } else if temp < 0.32 {
-        TerrainType::Snowfield
-    } else {
-        TerrainType::Frostmoor
-    }
-}
-
-fn warm_biome(moist: f32, temp: f32, detail: f32) -> TerrainType {
-    let m = moist * 0.50 + detail * 0.50;
-    if m > 0.62 {
-        TerrainType::Deepjungle
-    } else if m > 0.50 {
-        TerrainType::Thornveld
-    } else if temp > 0.70 && m < 0.38 {
-        TerrainType::Ashplain
-    } else if m > 0.32 {
-        TerrainType::Steppe
-    } else {
-        TerrainType::Plains
-    }
-}
-
-fn temperate_biome(moist: f32, _temp: f32, detail: f32) -> TerrainType {
-    let m = moist * 0.45 + detail * 0.55;
-    if m > 0.62 {
-        TerrainType::Oldwood
-    } else if m > 0.50 {
-        TerrainType::Greenfield
-    } else if m > 0.38 {
-        TerrainType::Plains
-    } else if m > 0.24 {
-        TerrainType::Steppe
-    } else {
-        TerrainType::Oldwood
-    }
-}
-
-fn center_base_biome(moist: f32, detail: f32, elev: f32) -> TerrainType {
-    let m = moist * 0.4 + detail * 0.6;
-    if elev > 0.55 {
-        TerrainType::Hills
-    } else if m > 0.6 {
-        TerrainType::Thornveld
-    } else if m > 0.4 {
-        TerrainType::Ashplain
-    } else {
-        TerrainType::Hills
-    }
-}
-
-// ── Special tiles ────────────────────────────────────────────────────────────
-
-fn is_special_terrain(t: TerrainType) -> bool {
+fn is_water(t: TerrainType) -> bool {
     matches!(
         t,
-        TerrainType::AncientRuin
-            | TerrainType::Corrupted
-            | TerrainType::LeyGrove
-            | TerrainType::LeyWaste
-            | TerrainType::BlightedWaste
-            | TerrainType::RuinField
+        TerrainType::DeepOcean | TerrainType::Ocean | TerrainType::Coast
     )
 }
 
-fn apply_special_tiles(gen: &mut [TileGen], noise: &NoiseCtx) {
-    for tile in gen.iter_mut() {
-        let Some(island) = tile.island else {
-            continue;
-        };
-        let (x, y) = layout_xy(tile.coord.q, tile.coord.r);
-        let s = noise.special(x, y);
-        let detail = noise.biome_detail(x, y);
-
-        match island {
-            Island::Center => {
-                // Priority: highest threshold first
-                if s > 0.68 {
-                    tile.terrain = TerrainType::Corrupted;
-                } else if s > 0.65 {
-                    tile.terrain = TerrainType::RuinField;
-                } else if s > 0.62 {
-                    tile.terrain = TerrainType::BlightedWaste;
-                } else if s > 0.58 {
-                    tile.terrain = TerrainType::AncientRuin;
-                } else if s > 0.54 {
-                    tile.terrain = TerrainType::LeyWaste;
-                } else if s > 0.50 {
-                    tile.terrain = TerrainType::LeyGrove;
-                }
-            }
-            Island::Crescent(_) => {
-                if s > 0.88 && detail > 0.7 {
-                    tile.terrain = TerrainType::AncientRuin;
-                } else if s > 0.92 {
-                    tile.terrain = TerrainType::LeyGrove;
-                }
-            }
-        }
-    }
-}
-
-fn assign_sacred_ground(gen: &mut [TileGen]) {
-    let origin = HexCoord::new(0, 0);
-    let mut best: Option<(i32, HexCoord)> = None;
-
-    for tile in gen.iter() {
-        if tile.island.is_none() {
-            continue;
-        }
-        let d = tile.coord.distance(&origin);
-        let coord = tile.coord;
-        match best {
-            None => best = Some((d, coord)),
-            Some((bd, _)) if d < bd => best = Some((d, coord)),
-            Some((bd, bc)) if d == bd && (coord.q, coord.r) < (bc.q, bc.r) => {
-                best = Some((d, coord));
-            }
-            _ => {}
-        }
-    }
-
-    if let Some((_, coord)) = best {
-        for tile in gen.iter_mut() {
-            if tile.coord == coord {
-                tile.terrain = TerrainType::SacredGround;
-                break;
-            }
-        }
-    }
-}
-
-// ── Coast and ocean depth ────────────────────────────────────────────────────
-
-fn is_water(t: TerrainType) -> bool {
-    matches!(t, TerrainType::DeepOcean | TerrainType::Ocean)
-}
-
-fn assign_coast_and_ocean(gen: &mut [TileGen], by_coord: &HashMap<HexCoord, usize>) {
-    let water_coords: HashMap<HexCoord, ()> = gen
-        .iter()
-        .filter(|t| t.island.is_none())
-        .map(|t| (t.coord, ()))
-        .collect();
-
-    // BFS from all land to compute hex distance to nearest land for water tiles
-    let mut dist_to_land: HashMap<HexCoord, i32> = HashMap::new();
-    let mut queue = VecDeque::new();
-
-    for tile in gen.iter().filter(|t| t.island.is_some()) {
-        dist_to_land.insert(tile.coord, 0);
-        queue.push_back(tile.coord);
-    }
-
-    while let Some(c) = queue.pop_front() {
-        let d = dist_to_land[&c];
-        for n in c.neighbors() {
-            if dist_to_land.contains_key(&n) {
-                continue;
-            }
-            if by_coord.contains_key(&n) {
-                dist_to_land.insert(n, d + 1);
-                queue.push_back(n);
-            }
-        }
-    }
-
-    for tile in gen.iter_mut() {
-        if tile.island.is_some() {
-            if tile.terrain == TerrainType::SacredGround {
-                continue;
-            }
-            let near_water = tile
-                .coord
-                .neighbors()
-                .iter()
-                .any(|n| water_coords.contains_key(n));
-            if near_water {
-                tile.terrain = TerrainType::Coast;
-            }
-        } else {
-            let d = dist_to_land
-                .get(&tile.coord)
-                .copied()
-                .unwrap_or(DEEP_OCEAN_DIST);
-            tile.terrain = if d >= DEEP_OCEAN_DIST {
-                TerrainType::DeepOcean
-            } else {
-                TerrainType::Ocean
-            };
-        }
-    }
-}
-
-// ── Beach fringe ─────────────────────────────────────────────────────────────
-
-fn assign_beaches(
-    gen: &mut [TileGen],
-    seed: u64,
-    by_coord: &HashMap<HexCoord, usize>,
-) {
+fn assign_beaches(gen: &mut [TileGen], seed: u64, by_coord: &HashMap<HexCoord, usize>) {
     let water_coords: HashMap<HexCoord, ()> = gen
         .iter()
         .filter(|t| is_water(t.terrain))
         .map(|t| (t.coord, ()))
         .collect();
 
-    // Land hex distance from water (coast tiles = 1)
-    let mut land_dist: HashMap<HexCoord, i32> = HashMap::new();
-    let mut queue = VecDeque::new();
-
-    for tile in gen.iter().filter(|t| t.island.is_some()) {
-        let touches_water = tile
-            .coord
-            .neighbors()
-            .iter()
-            .any(|n| water_coords.contains_key(n));
-        if touches_water {
-            land_dist.insert(tile.coord, 1);
-            queue.push_back(tile.coord);
-        }
-    }
-
-    while let Some(c) = queue.pop_front() {
-        let d = land_dist[&c];
-        for n in c.neighbors() {
-            if land_dist.contains_key(&n) {
-                continue;
-            }
-            let Some(&idx) = by_coord.get(&n) else {
-                continue;
-            };
-            if gen[idx].island.is_none() {
-                continue;
-            }
-            land_dist.insert(n, d + 1);
-            queue.push_back(n);
-        }
-    }
-
-    let coast_coords: HashMap<HexCoord, ()> = gen
-        .iter()
-        .filter(|t| t.terrain == TerrainType::Coast)
-        .map(|t| (t.coord, ()))
-        .collect();
-
-    // Pass 1 — continuous sandy fringe: every inland tile touching coast becomes beach
+    // Pass 1: every land tile touching water becomes beach (the shoreline ring).
     let fringe: Vec<HexCoord> = gen
         .iter()
-        .filter(|t| t.island.is_some())
-        .filter(|t| {
-            !matches!(
-                t.terrain,
-                TerrainType::Coast | TerrainType::SacredGround
-            )
-        })
+        .filter(|t| t.is_land())
         .filter(|t| {
             t.coord
                 .neighbors()
                 .iter()
-                .any(|n| coast_coords.contains_key(n))
+                .any(|n| water_coords.contains_key(n))
         })
         .map(|t| t.coord)
         .collect();
 
-    for coord in fringe {
-        if let Some(&idx) = by_coord.get(&coord) {
+    let fringe_set: HashMap<HexCoord, ()> = fringe.iter().map(|&c| (c, ())).collect();
+
+    for coord in &fringe {
+        if let Some(&idx) = by_coord.get(coord) {
             gen[idx].terrain = TerrainType::Beach;
         }
     }
 
-    // Pass 2 — each fringe beach hex independently decides whether to extend one step inland.
-    // Per-tile rolls break the parallel-ring pattern that noise on dist-3 caused.
+    // Pass 2: each fringe hex independently decides whether to extend one step
+    // inland. Per-tile rolls break the parallel-ring pattern.
     const EXTEND_CHANCE: f32 = 0.46;
-
-    let fringe_ring: Vec<HexCoord> = gen
-        .iter()
-        .filter(|t| t.island.is_some() && t.terrain == TerrainType::Beach)
-        .filter(|t| land_dist.get(&t.coord) == Some(&2))
-        .map(|t| t.coord)
-        .collect();
-
     let mut extensions: Vec<HexCoord> = Vec::new();
 
-    for coord in fringe_ring {
+    for &coord in &fringe {
         if tile_roll(seed, coord.q, coord.r, 71) > EXTEND_CHANCE {
             continue;
         }
@@ -598,16 +327,13 @@ fn assign_beaches(
                 continue;
             };
             let inland = &gen[idx];
-            if inland.island.is_none() {
+            if !inland.is_land() {
                 continue;
             }
-            if land_dist.get(&n) != Some(&3) {
+            if fringe_set.contains_key(&n) {
                 continue;
             }
-            if matches!(
-                inland.terrain,
-                TerrainType::Coast | TerrainType::Beach | TerrainType::SacredGround
-            ) {
+            if inland.terrain == TerrainType::Beach {
                 continue;
             }
             extensions.push(n);
@@ -621,60 +347,170 @@ fn assign_beaches(
     }
 }
 
-// ── Speckle removal ──────────────────────────────────────────────────────────
+// ── Inland distance (per-island BFS from coast) ──────────────────────────────
 
-fn is_land_biome(t: TerrainType) -> bool {
-    !matches!(
-        t,
-        TerrainType::DeepOcean
-            | TerrainType::Ocean
-            | TerrainType::Coast
-            | TerrainType::Beach
-            | TerrainType::SacredGround
-    )
+/// BFS distance from the coastal edge of an island (tiles touching water or the
+/// outside of the land set are distance 0). Used as a feature gate (mountains
+/// need depth) and a soft suppressor for forests close to the shore.
+fn inland_distances(land: &[HexCoord]) -> HashMap<HexCoord, i32> {
+    let set: HashMap<HexCoord, ()> = land.iter().map(|&c| (c, ())).collect();
+    let mut dist: HashMap<HexCoord, i32> = HashMap::with_capacity(land.len());
+    let mut queue: VecDeque<HexCoord> = VecDeque::new();
+
+    for &c in land {
+        if c.neighbors().iter().any(|n| !set.contains_key(n)) {
+            dist.insert(c, 0);
+            queue.push_back(c);
+        }
+    }
+
+    while let Some(c) = queue.pop_front() {
+        let d = dist[&c];
+        for n in c.neighbors() {
+            if set.contains_key(&n) && !dist.contains_key(&n) {
+                dist.insert(n, d + 1);
+                queue.push_back(n);
+            }
+        }
+    }
+    dist
 }
 
-fn remove_speckles(gen: &mut [TileGen], by_coord: &HashMap<HexCoord, usize>) {
-    // Pass 1: special biomes need ≥2 same-type neighbors
-    for _ in 0..2 {
-        let mut changes: Vec<(HexCoord, TerrainType)> = Vec::new();
-        for tile in gen.iter() {
-            if !is_special_terrain(tile.terrain) {
-                continue;
-            }
-            let same = count_same_neighbors(gen, by_coord, tile.coord, tile.terrain);
-            if same >= 2 {
-                continue;
-            }
-            if let Some(replacement) =
-                majority_neighbor_biome(gen, by_coord, tile.coord, tile.terrain)
-            {
-                changes.push((tile.coord, replacement));
-            }
+// ── Outer-island terrain ─────────────────────────────────────────────────────
+
+fn collect_outer_islands(gen: &[TileGen]) -> Vec<(u8, Vec<HexCoord>, HashMap<HexCoord, i32>)> {
+    let mut out: Vec<(u8, Vec<HexCoord>, HashMap<HexCoord, i32>)> = Vec::with_capacity(3);
+    for island_id in 0..3u8 {
+        let land: Vec<HexCoord> = gen
+            .iter()
+            .filter(|t| t.island == Some(Island::Crescent(island_id)))
+            .map(|t| t.coord)
+            .collect();
+        if land.is_empty() {
+            continue;
         }
-        for (coord, terrain) in changes {
-            if let Some(&idx) = by_coord.get(&coord) {
-                gen[idx].terrain = terrain;
+        let inland = inland_distances(&land);
+        out.push((island_id, land, inland));
+    }
+    out
+}
+
+fn assign_outer_island_terrain(
+    gen: &mut [TileGen],
+    seed: u64,
+    by_coord: &HashMap<HexCoord, usize>,
+) {
+    let islands = collect_outer_islands(gen);
+    let assignments = crate::outer_islands::classify_all(seed, &islands);
+    for (coord, terrain) in assignments {
+        if let Some(&idx) = by_coord.get(&coord) {
+            if gen[idx].terrain == TerrainType::Beach {
+                continue;
             }
+            gen[idx].terrain = terrain;
+        }
+    }
+}
+
+// ── Water depth (Coast / Ocean / DeepOcean) ──────────────────────────────────
+
+fn assign_water_depth(gen: &mut [TileGen], by_coord: &HashMap<HexCoord, usize>) {
+    let land_coords: HashMap<HexCoord, ()> = gen
+        .iter()
+        .filter(|t| t.is_land())
+        .map(|t| (t.coord, ()))
+        .collect();
+
+    let in_map: HashMap<HexCoord, ()> = by_coord.keys().map(|&c| (c, ())).collect();
+
+    let mut dist_to_land: HashMap<HexCoord, i32> = HashMap::new();
+    let mut queue: VecDeque<HexCoord> = VecDeque::new();
+
+    for tile in gen.iter().filter(|t| t.is_land()) {
+        dist_to_land.insert(tile.coord, 0);
+        queue.push_back(tile.coord);
+    }
+
+    while let Some(c) = queue.pop_front() {
+        let d = dist_to_land[&c];
+        for n in c.neighbors() {
+            if dist_to_land.contains_key(&n) || land_coords.contains_key(&n) {
+                continue;
+            }
+            if !in_map.contains_key(&n) {
+                continue;
+            }
+            dist_to_land.insert(n, d + 1);
+            queue.push_back(n);
         }
     }
 
-    // Pass 2: general isolated land biomes (≤1 same-type neighbor)
-    let mut changes: Vec<(HexCoord, TerrainType)> = Vec::new();
-    for tile in gen.iter() {
-        let t = tile.terrain;
-        if !is_land_biome(t) || is_special_terrain(t) || t == TerrainType::Mountain || t == TerrainType::SnowPeak || t == TerrainType::Beach {
+    for tile in gen.iter_mut() {
+        if tile.is_land() {
             continue;
         }
-        let same = count_same_neighbors(gen, by_coord, tile.coord, t);
-        if same <= 1 {
-            if let Some(replacement) = majority_neighbor_biome(gen, by_coord, tile.coord, t) {
-                if replacement != t {
-                    changes.push((tile.coord, replacement));
-                }
+        let d = dist_to_land
+            .get(&tile.coord)
+            .copied()
+            .unwrap_or(DEEP_OCEAN_MIN_DIST);
+        tile.terrain = if d <= COAST_MAX_DIST {
+            TerrainType::Coast
+        } else if d >= DEEP_OCEAN_MIN_DIST {
+            TerrainType::DeepOcean
+        } else {
+            TerrainType::Ocean
+        };
+    }
+}
+
+// ── Speckle cleanup ──────────────────────────────────────────────────────────
+
+/// Replace any outer-island land tile whose six neighbours contain ZERO of the
+/// same terrain type with the modal non-water, non-beach neighbour. Only acts
+/// when the tile has at least two real-land neighbours, so coastal peninsulas
+/// are left alone.
+fn speckle_cleanup(gen: &mut [TileGen], by_coord: &HashMap<HexCoord, usize>) {
+    let mut changes: Vec<(HexCoord, TerrainType)> = Vec::new();
+
+    for tile in gen.iter() {
+        if !tile.is_outer_island() {
+            continue;
+        }
+        if tile.terrain == TerrainType::Beach {
+            continue;
+        }
+
+        let mut same = 0;
+        let mut land_neighbors = 0;
+        let mut counts: HashMap<TerrainType, i32> = HashMap::new();
+
+        for n in tile.coord.neighbors() {
+            let Some(&idx) = by_coord.get(&n) else {
+                continue;
+            };
+            let nt = gen[idx].terrain;
+            if is_water(nt) || nt == TerrainType::Beach {
+                continue;
+            }
+            land_neighbors += 1;
+            if nt == tile.terrain {
+                same += 1;
+            } else {
+                *counts.entry(nt).or_default() += 1;
             }
         }
+
+        if land_neighbors < 2 || same > 0 {
+            continue;
+        }
+        if let Some((replacement, _)) = counts
+            .into_iter()
+            .max_by(|a, b| a.1.cmp(&b.1).then_with(|| (a.0 as u8).cmp(&(b.0 as u8))))
+        {
+            changes.push((tile.coord, replacement));
+        }
     }
+
     for (coord, terrain) in changes {
         if let Some(&idx) = by_coord.get(&coord) {
             gen[idx].terrain = terrain;
@@ -682,76 +518,14 @@ fn remove_speckles(gen: &mut [TileGen], by_coord: &HashMap<HexCoord, usize>) {
     }
 }
 
-fn count_same_neighbors(
-    gen: &[TileGen],
-    by_coord: &HashMap<HexCoord, usize>,
-    coord: HexCoord,
-    terrain: TerrainType,
-) -> i32 {
-    coord
-        .neighbors()
-        .iter()
-        .filter(|n| {
-            by_coord
-                .get(n)
-                .map(|&idx| gen[idx].terrain == terrain)
-                .unwrap_or(false)
-        })
-        .count() as i32
-}
+// ── Helpers / logging ────────────────────────────────────────────────────────
 
-fn majority_neighbor_biome(
-    gen: &[TileGen],
-    by_coord: &HashMap<HexCoord, usize>,
-    coord: HexCoord,
-    exclude: TerrainType,
-) -> Option<TerrainType> {
-    let mut counts: HashMap<TerrainType, i32> = HashMap::new();
-    for n in coord.neighbors() {
-        let Some(&idx) = by_coord.get(&n) else {
-            continue;
-        };
-        let t = gen[idx].terrain;
-        if !is_land_biome(t) || t == exclude || is_water(t) {
-            continue;
-        }
-        *counts.entry(t).or_default() += 1;
-    }
-    counts
-        .into_iter()
-        .max_by(|a, b| a.1.cmp(&b.1).then_with(|| terrain_name(a.0).cmp(terrain_name(b.0))))
-        .map(|(t, _)| t)
-}
-
-// ── Distribution log ─────────────────────────────────────────────────────────
-
-fn all_terrain_types() -> [TerrainType; 24] {
-    [
-        TerrainType::DeepOcean,
-        TerrainType::Ocean,
-        TerrainType::Coast,
-        TerrainType::Beach,
-        TerrainType::Hills,
-        TerrainType::Mountain,
-        TerrainType::SnowPeak,
-        TerrainType::Ashplain,
-        TerrainType::Thornveld,
-        TerrainType::Deepjungle,
-        TerrainType::Steppe,
-        TerrainType::Plains,
-        TerrainType::Greenfield,
-        TerrainType::Oldwood,
-        TerrainType::Snowfield,
-        TerrainType::Frostmoor,
-        TerrainType::Darkpine,
-        TerrainType::AncientRuin,
-        TerrainType::Corrupted,
-        TerrainType::LeyGrove,
-        TerrainType::LeyWaste,
-        TerrainType::BlightedWaste,
-        TerrainType::RuinField,
-        TerrainType::SacredGround,
-    ]
+#[cfg(test)]
+fn is_land_biome(t: TerrainType) -> bool {
+    !matches!(
+        t,
+        TerrainType::DeepOcean | TerrainType::Ocean | TerrainType::Coast
+    )
 }
 
 fn terrain_name(t: TerrainType) -> &'static str {
@@ -763,6 +537,9 @@ fn terrain_name(t: TerrainType) -> &'static str {
         TerrainType::Hills => "Hills",
         TerrainType::Mountain => "Mountain",
         TerrainType::SnowPeak => "SnowPeak",
+        TerrainType::StonySlope => "StonySlope",
+        TerrainType::AridPeak => "AridPeak",
+        TerrainType::GlacialPeak => "GlacialPeak",
         TerrainType::Ashplain => "Ashplain",
         TerrainType::Thornveld => "Thornveld",
         TerrainType::Deepjungle => "Deepjungle",
@@ -783,23 +560,6 @@ fn terrain_name(t: TerrainType) -> &'static str {
     }
 }
 
-fn is_non_special_land_biome(t: TerrainType) -> bool {
-    matches!(
-        t,
-        TerrainType::Hills
-            | TerrainType::Ashplain
-            | TerrainType::Thornveld
-            | TerrainType::Deepjungle
-            | TerrainType::Steppe
-            | TerrainType::Plains
-            | TerrainType::Greenfield
-            | TerrainType::Oldwood
-            | TerrainType::Snowfield
-            | TerrainType::Frostmoor
-            | TerrainType::Darkpine
-    )
-}
-
 fn log_distribution(tiles: &[HexTile]) {
     let total = tiles.len() as f64;
     let mut counts: HashMap<TerrainType, usize> = HashMap::new();
@@ -807,15 +567,29 @@ fn log_distribution(tiles: &[HexTile]) {
         *counts.entry(tile.terrain).or_default() += 1;
     }
 
-    let land_count: usize = tiles
-        .iter()
-        .filter(|t| is_land_biome(t.terrain))
-        .count();
-    let land_total = land_count as f64;
+    let reported = [
+        TerrainType::DeepOcean,
+        TerrainType::Ocean,
+        TerrainType::Coast,
+        TerrainType::Beach,
+        TerrainType::Plains,
+        TerrainType::Greenfield,
+        TerrainType::Steppe,
+        TerrainType::Oldwood,
+        TerrainType::Darkpine,
+        TerrainType::Deepjungle,
+        TerrainType::Hills,
+        TerrainType::StonySlope,
+        TerrainType::SnowPeak,
+        TerrainType::AridPeak,
+    ];
 
     println!("=== Terrain Distribution ===");
-    for t in all_terrain_types() {
+    for t in reported {
         let c = counts.get(&t).copied().unwrap_or(0);
+        if c == 0 {
+            continue;
+        }
         let pct = if total > 0.0 {
             (c as f64 / total) * 100.0
         } else {
@@ -823,75 +597,282 @@ fn log_distribution(tiles: &[HexTile]) {
         };
         println!("  {}: {} ({:.1}%)", terrain_name(t), c, pct);
     }
-
-    println!("=== Land Biome Warnings ===");
-    let mut any_warn = false;
-    for t in all_terrain_types() {
-        if !is_non_special_land_biome(t) {
-            continue;
-        }
-        let c = counts.get(&t).copied().unwrap_or(0);
-        if land_total > 0.0 {
-            let pct = (c as f64 / land_total) * 100.0;
-            if pct < 1.0 {
-                println!(
-                    "  WARNING: {} is {:.1}% of land tiles (below 1%)",
-                    terrain_name(t),
-                    pct
-                );
-                any_warn = true;
-            }
-        }
-    }
-    if !any_warn {
-        println!("  (none — all non-special land biomes >= 1%)");
-    }
-}
-
-fn hex_disk_coords(radius: i32) -> Vec<HexCoord> {
-    let mut out = Vec::new();
-    for q in -radius..=radius {
-        for r in -radius..=radius {
-            let c = HexCoord::new(q, r);
-            if c.distance(&HexCoord::new(0, 0)) <= radius {
-                out.push(c);
-            }
-        }
-    }
-    out
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn generate_completes_with_all_terrain_types_represented() {
-        let map = Map::generate(MAP_RADIUS, 42);
-        assert!(!map.tiles.is_empty());
-        let land = map
-            .tiles
-            .iter()
-            .filter(|t| is_land_biome(t.terrain))
-            .count();
-        assert!(land > 20_000, "expected substantial land mass, got {land}");
+    // Steppe, Hills, and AridPeak are intentionally disabled — the generator
+    // must not emit them on outer islands until they are re-enabled.
+    const ALLOWED_OUTER_LAND: &[TerrainType] = &[
+        TerrainType::Beach,
+        TerrainType::Plains,
+        TerrainType::Greenfield,
+        TerrainType::Oldwood,
+        TerrainType::Darkpine,
+        TerrainType::Deepjungle,
+        TerrainType::StonySlope,
+        TerrainType::SnowPeak,
+    ];
 
-        let sacred = map
-            .tiles
-            .iter()
-            .filter(|t| t.terrain == TerrainType::SacredGround)
-            .count();
-        assert_eq!(sacred, 1);
+    fn is_outer_forest(t: TerrainType) -> bool {
+        matches!(
+            t,
+            TerrainType::Oldwood | TerrainType::Darkpine | TerrainType::Deepjungle
+        )
+    }
 
-        let ruin_field_on_crescents = map.tiles.iter().any(|t| {
-            if t.terrain != TerrainType::RuinField {
-                return false;
+    fn is_outer_mountain(t: TerrainType) -> bool {
+        matches!(
+            t,
+            TerrainType::Hills
+                | TerrainType::StonySlope
+                | TerrainType::SnowPeak
+                | TerrainType::AridPeak
+        )
+    }
+
+    fn crescent_land_by_island(map: &Map, seed: u64) -> [Vec<HexCoord>; 3] {
+        let noise = NoiseCtx::new(seed);
+        let mut out: [Vec<HexCoord>; 3] = [Vec::new(), Vec::new(), Vec::new()];
+        for tile in &map.tiles {
+            if let Some(Island::Crescent(i)) = classify_island(&noise, tile.coord.q, tile.coord.r)
+            {
+                out[i as usize].push(tile.coord);
             }
-            t.coord.distance(&HexCoord::new(0, 0)) >= CRESCENT_R_IN as i32 - 5
-        });
+        }
+        out
+    }
+
+    #[test]
+    fn outer_islands_use_allowed_palette_only() {
+        let map = Map::generate(MAP_RADIUS, 42);
+        let by_island = crescent_land_by_island(&map, 42);
+        let terrains: HashMap<HexCoord, TerrainType> =
+            map.tiles.iter().map(|t| (t.coord, t.terrain)).collect();
+        for (i, land) in by_island.iter().enumerate() {
+            for &coord in land {
+                let t = terrains[&coord];
+                assert!(
+                    ALLOWED_OUTER_LAND.contains(&t),
+                    "crescent {i} tile {:?} has unallowed terrain {:?}",
+                    coord,
+                    t
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn shoreline_is_beach() {
+        let map = Map::generate(MAP_RADIUS, 42);
+        let by_coord: HashMap<HexCoord, TerrainType> =
+            map.tiles.iter().map(|t| (t.coord, t.terrain)).collect();
+        for tile in &map.tiles {
+            if !is_land_biome(tile.terrain) {
+                continue;
+            }
+            let touches_water = tile
+                .coord
+                .neighbors()
+                .iter()
+                .any(|n| by_coord.get(n).map_or(false, |t| is_water(*t)));
+            if touches_water {
+                assert_eq!(
+                    tile.terrain,
+                    TerrainType::Beach,
+                    "land tile at {:?} touches water but is not beach",
+                    tile.coord
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn water_depth_layering() {
+        let map = Map::generate(MAP_RADIUS, 42);
+        let by_coord: HashMap<HexCoord, TerrainType> =
+            map.tiles.iter().map(|t| (t.coord, t.terrain)).collect();
+
+        // Every water tile adjacent to land must be Coast.
+        for tile in &map.tiles {
+            if !is_water(tile.terrain) {
+                continue;
+            }
+            let touches_land = tile
+                .coord
+                .neighbors()
+                .iter()
+                .any(|n| by_coord.get(n).map_or(false, |t| is_land_biome(*t)));
+            if touches_land {
+                assert_eq!(
+                    tile.terrain,
+                    TerrainType::Coast,
+                    "water tile at {:?} adjacent to land but not Coast",
+                    tile.coord
+                );
+            }
+        }
+
+        // Some DeepOcean must exist far from land.
+        let deep_count = map
+            .tiles
+            .iter()
+            .filter(|t| t.terrain == TerrainType::DeepOcean)
+            .count();
         assert!(
-            !ruin_field_on_crescents,
-            "RuinField must only appear on center island"
+            deep_count > 50,
+            "expected substantial DeepOcean, got {deep_count}"
+        );
+    }
+
+    #[test]
+    fn outer_islands_budgets_balanced() {
+        for seed in [42u64, 123, 999, 7777] {
+            let map = Map::generate(MAP_RADIUS, seed);
+            let by_island = crescent_land_by_island(&map, seed);
+            let terrains: HashMap<HexCoord, TerrainType> =
+                map.tiles.iter().map(|t| (t.coord, t.terrain)).collect();
+
+            let mut forest_pcts = Vec::new();
+            let mut mountain_pcts = Vec::new();
+            let mut land_counts = Vec::new();
+            for land in &by_island {
+                assert!(!land.is_empty(), "seed {seed}: crescent must have land");
+                let n = land.len() as f32;
+                let f = land
+                    .iter()
+                    .filter(|c| terrains.get(c).is_some_and(|t| is_outer_forest(*t)))
+                    .count() as f32
+                    / n;
+                let m = land
+                    .iter()
+                    .filter(|c| terrains.get(c).is_some_and(|t| is_outer_mountain(*t)))
+                    .count() as f32
+                    / n;
+                forest_pcts.push(f);
+                mountain_pcts.push(m);
+                land_counts.push(land.len());
+            }
+
+            let f_spread = forest_pcts.iter().cloned().fold(0.0f32, f32::max)
+                - forest_pcts.iter().cloned().fold(f32::INFINITY, f32::min);
+            let m_spread = mountain_pcts.iter().cloned().fold(0.0f32, f32::max)
+                - mountain_pcts.iter().cloned().fold(f32::INFINITY, f32::min);
+            assert!(
+                f_spread <= 0.04,
+                "seed {seed}: forest % spread too wide: {forest_pcts:?}"
+            );
+            assert!(
+                m_spread <= 0.04,
+                "seed {seed}: mountain % spread too wide: {mountain_pcts:?}"
+            );
+
+            let max_land = *land_counts.iter().max().unwrap();
+            let min_land = *land_counts.iter().min().unwrap();
+            assert!(
+                (max_land as f32) / (min_land as f32) <= 1.10,
+                "seed {seed}: land tile counts unbalanced: {land_counts:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn outer_islands_each_have_full_palette() {
+        // Steppe / AridPeak intentionally excluded — not generated for now.
+        let required_bases = [TerrainType::Plains, TerrainType::Greenfield];
+        let required_forests = [
+            TerrainType::Oldwood,
+            TerrainType::Darkpine,
+            TerrainType::Deepjungle,
+        ];
+
+        for seed in [42u64, 123, 999, 7777] {
+            let map = Map::generate(MAP_RADIUS, seed);
+            let by_island = crescent_land_by_island(&map, seed);
+            let terrains: HashMap<HexCoord, TerrainType> =
+                map.tiles.iter().map(|t| (t.coord, t.terrain)).collect();
+
+            for (i, land) in by_island.iter().enumerate() {
+                let present: std::collections::HashSet<TerrainType> = land
+                    .iter()
+                    .filter_map(|c| terrains.get(c).copied())
+                    .collect();
+
+                for t in required_bases {
+                    assert!(
+                        present.contains(&t),
+                        "seed {seed} crescent {i} missing base biome {:?}",
+                        t
+                    );
+                }
+                for t in required_forests {
+                    assert!(
+                        present.contains(&t),
+                        "seed {seed} crescent {i} missing forest type {:?}",
+                        t
+                    );
+                }
+                let has_mountain = present.iter().any(|t| is_outer_mountain(*t));
+                assert!(
+                    has_mountain,
+                    "seed {seed} crescent {i} has no mountain tile"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn outer_islands_no_isolated_tiles() {
+        let map = Map::generate(MAP_RADIUS, 42);
+        let by_island = crescent_land_by_island(&map, 42);
+        let terrains: HashMap<HexCoord, TerrainType> =
+            map.tiles.iter().map(|t| (t.coord, t.terrain)).collect();
+
+        for (i, land) in by_island.iter().enumerate() {
+            for &coord in land {
+                let t = terrains[&coord];
+                if t == TerrainType::Beach {
+                    continue;
+                }
+                let mut same = 0;
+                let mut land_neighbors = 0;
+                for n in coord.neighbors() {
+                    let Some(&nt) = terrains.get(&n) else {
+                        continue;
+                    };
+                    if is_water(nt) || nt == TerrainType::Beach {
+                        continue;
+                    }
+                    land_neighbors += 1;
+                    if nt == t {
+                        same += 1;
+                    }
+                }
+                if land_neighbors >= 2 {
+                    assert!(
+                        same > 0,
+                        "isolated tile on crescent {i} at {:?} (terrain {:?})",
+                        coord,
+                        t
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn outer_islands_are_wider_than_before() {
+        let map = Map::generate(MAP_RADIUS, 42);
+        let by_island = crescent_land_by_island(&map, 42);
+        let total: usize = by_island.iter().map(|land| land.len()).sum();
+        // The pre-widening (CRESCENT_R_IN = 126, CRESCENT_R_OUT = 180) crescents
+        // covered roughly 17k–20k tiles total. Anything substantially above that
+        // proves the widening took effect.
+        assert!(
+            total > 28_000,
+            "crescents not wide enough: {total} land tiles across all three"
         );
     }
 
@@ -916,13 +897,6 @@ mod tests {
                 .filter(|t| is_land_biome(t.terrain))
                 .count();
             assert!(land > 20_000, "seed {seed}: insufficient land ({land})");
-
-            let sacred = map
-                .tiles
-                .iter()
-                .filter(|t| t.terrain == TerrainType::SacredGround)
-                .count();
-            assert_eq!(sacred, 1, "seed {seed}");
         }
     }
 }

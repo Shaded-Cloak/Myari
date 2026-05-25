@@ -1,7 +1,32 @@
 use std::ops::{Add, Sub};
 
+use hexx::{Hex, HexLayout, HexOrientation};
 use serde::{Deserialize, Serialize};
 
+/// Flat-top hex layout used for pixel ↔ axial conversion.
+fn flat_layout(hex_size: f32) -> HexLayout {
+    HexLayout {
+        orientation: HexOrientation::Flat,
+        origin: hexx::Vec2::ZERO,
+        hex_size: hexx::Vec2::new(hex_size, hex_size),
+        invert_x: false,
+        invert_y: true,
+    }
+}
+
+/// Six corner positions for a hex at the origin (flat-top, Y-up).
+pub fn hex_corners_local(size: f32) -> [(f32, f32); 6] {
+    let corners = flat_layout(size).hex_corners(Hex::ZERO);
+    std::array::from_fn(|i| (corners[i].x, corners[i].y))
+}
+
+/// Six corner positions for a hex at axial `(q, r)`.
+pub fn hex_corners_at(q: i32, r: i32, size: f32) -> [(f32, f32); 6] {
+    let corners = flat_layout(size).hex_corners(Hex::new(q, r));
+    std::array::from_fn(|i| (corners[i].x, corners[i].y))
+}
+
+/// Axial hex coordinate (q, r) — backed by [`hexx::Hex`] for grid math.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Serialize, Deserialize)]
 pub struct HexCoord {
     pub q: i32,
@@ -13,75 +38,75 @@ impl HexCoord {
         Self { q, r }
     }
 
-    pub fn s(&self) -> i32 {
-        -self.q - self.r
+    pub fn origin() -> Self {
+        Self::new(0, 0)
+    }
+
+    fn hex(&self) -> Hex {
+        Hex::new(self.q, self.r)
     }
 
     pub fn distance(&self, other: &HexCoord) -> i32 {
-        ((self.q - other.q).abs()
-            + (self.r - other.r).abs()
-            + (self.s() - other.s()).abs())
-            / 2
+        self.hex().unsigned_distance_to(other.hex()) as i32
     }
 
     pub fn neighbors(&self) -> [HexCoord; 6] {
-        let dirs = [
-            (1, 0), (1, -1), (0, -1),
-            (-1, 0), (-1, 1), (0, 1),
-        ];
-        dirs.map(|(dq, dr)| HexCoord::new(self.q + dq, self.r + dr))
+        self.hex()
+            .all_neighbors()
+            .into_iter()
+            .map(|h| Self::new(h.x, h.y))
+            .collect::<Vec<_>>()
+            .try_into()
+            .unwrap()
     }
 }
 
 impl Add for HexCoord {
     type Output = Self;
     fn add(self, other: Self) -> Self {
-        Self::new(self.q + other.q, self.r + other.r)
+        let h = self.hex() + other.hex();
+        Self::new(h.x, h.y)
     }
 }
 
 impl Sub for HexCoord {
     type Output = Self;
     fn sub(self, other: Self) -> Self {
-        Self::new(self.q - other.q, self.r - other.r)
+        let h = self.hex() - other.hex();
+        Self::new(h.x, h.y)
     }
 }
 
-/// Convert axial coords to pixel center (flat-top)
+/// Convert axial coords to pixel center (flat-top).
 pub fn axial_to_pixel(q: i32, r: i32, size: f32) -> (f32, f32) {
-    let x = size * (3.0_f32.sqrt() * q as f32 + 3.0_f32.sqrt() / 2.0 * r as f32);
-    let y = size * (3.0 / 2.0 * r as f32);
-    (x, y)
+    let pos = flat_layout(size).hex_to_world_pos(Hex::new(q, r));
+    (pos.x, pos.y)
 }
 
-/// Convert pixel coords to axial (fractional)
+/// Convert pixel coords to axial (fractional).
 pub fn pixel_to_axial_frac(x: f32, y: f32, size: f32) -> (f32, f32) {
-    let q = (3.0_f32.sqrt() / 3.0 * x - 1.0 / 3.0 * y) / size;
-    let r = (2.0 / 3.0 * y) / size;
-    (q, r)
+    let frac = flat_layout(size).world_pos_to_fract_hex(hexx::Vec2::new(x, y));
+    (frac.x, frac.y)
 }
 
-/// Round fractional axial coords to nearest hex
+/// Round fractional axial coords to nearest hex.
 pub fn axial_round(q: f32, r: f32) -> HexCoord {
-    let s = -q - r;
-    let mut rq = q.round();
-    let mut rr = r.round();
-    let rs = s.round();
-    let dq = (rq - q).abs();
-    let dr = (rr - r).abs();
-    let ds = (rs - s).abs();
-    if dq > dr && dq > ds {
-        rq = -rr - rs;
-    } else if dr > ds {
-        rr = -rq - rs;
-    }
-    HexCoord::new(rq as i32, rr as i32)
+    let h = Hex::new(q.round() as i32, r.round() as i32);
+    HexCoord::new(h.x, h.y)
 }
 
-/// Convert pixel to hex
+/// Convert pixel to hex.
 pub fn pixel_to_hex(x: f32, y: f32, size: f32) -> HexCoord {
-    let (q, r) = pixel_to_axial_frac(x, y, size);
-    axial_round(q, r)
+    let h = flat_layout(size).world_pos_to_hex(hexx::Vec2::new(x, y));
+    HexCoord::new(h.x, h.y)
+}
+
+/// All hexes in a disk centered on the origin.
+pub fn hex_disk(radius: i32) -> Vec<HexCoord> {
+    Hex::ZERO
+        .range(radius as u32)
+        .map(|h| HexCoord::new(h.x, h.y))
+        .collect()
 }
 
 #[cfg(test)]
@@ -101,5 +126,11 @@ mod tests {
             let back = pixel_to_hex(x, y, 28.0);
             assert_eq!(back, c);
         }
+    }
+
+    #[test]
+    fn disk_matches_hexx_range() {
+        let disk = hex_disk(3);
+        assert_eq!(disk.len(), Hex::ZERO.range(3).count());
     }
 }

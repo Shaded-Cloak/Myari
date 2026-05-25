@@ -273,9 +273,11 @@ fn find_best_start(
     for tile in tiles {
         let c = tile.coord;
 
-        // Must be settleable terrain
+        // Must be settleable terrain (Coast is shallow water now, not land).
         match tile.terrain {
-            TerrainType::DeepOcean | TerrainType::Ocean | TerrainType::Mountain | TerrainType::SnowPeak => continue,
+            TerrainType::DeepOcean | TerrainType::Ocean | TerrainType::Coast
+            | TerrainType::Mountain | TerrainType::SnowPeak | TerrainType::AridPeak
+            | TerrainType::GlacialPeak => continue,
             _ => {}
         }
 
@@ -327,7 +329,8 @@ fn find_best_start(
     best.map(|(c, _)| c)
 }
 
-/// Whether a scout can enter this terrain.
+/// Whether a scout can enter this terrain. Coast is shallow water, not land,
+/// so it is intentionally excluded.
 pub fn is_walkable(terrain: TerrainType) -> bool {
     matches!(
         terrain,
@@ -342,7 +345,7 @@ pub fn is_walkable(terrain: TerrainType) -> bool {
             | TerrainType::Frostmoor
             | TerrainType::Darkpine
             | TerrainType::Hills
-            | TerrainType::Coast
+            | TerrainType::StonySlope
             | TerrainType::Beach
             | TerrainType::AncientRuin
             | TerrainType::LeyGrove
@@ -368,7 +371,9 @@ pub fn terrain_yields(terrain: TerrainType) -> Yields {
         TerrainType::Frostmoor => Yields { food: 0, production: 1, gold: 0 },
         TerrainType::Darkpine => Yields { food: 1, production: 1, gold: 0 },
         TerrainType::Hills => Yields { food: 0, production: 2, gold: 0 },
+        TerrainType::StonySlope => Yields { food: 0, production: 2, gold: 0 },
         TerrainType::Mountain | TerrainType::SnowPeak => Yields { food: 0, production: 1, gold: 1 },
+        TerrainType::AridPeak | TerrainType::GlacialPeak => Yields { food: 0, production: 1, gold: 1 },
         TerrainType::AncientRuin => Yields { food: 0, production: 0, gold: 3 },
         TerrainType::Corrupted | TerrainType::BlightedWaste => Yields::default(),
         TerrainType::LeyGrove => Yields { food: 1, production: 1, gold: 2 },
