@@ -37,6 +37,21 @@ pub fn ease_out_cubic(t: f32) -> f32 {
     1.0 - (1.0 - t).powi(3)
 }
 
+pub fn smooth_follow(current: f32, target: f32, delta_secs: f32, speed: f32) -> f32 {
+    if delta_secs <= 0.0 {
+        return current;
+    }
+    let t = 1.0 - (-speed * delta_secs).exp();
+    current + (target - current) * t
+}
+
+pub fn smooth_follow_vec2(current: Vec2, target: Vec2, delta_secs: f32, speed: f32) -> Vec2 {
+    Vec2::new(
+        smooth_follow(current.x, target.x, delta_secs, speed),
+        smooth_follow(current.y, target.y, delta_secs, speed),
+    )
+}
+
 pub fn menu_panel_intro_transform(t: f32) -> Transform {
     let eased = ease_out_cubic(t);
     Transform {

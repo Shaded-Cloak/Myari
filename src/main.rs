@@ -88,11 +88,17 @@ fn main() {
                 title_menu::handle_title_back,
                 title_menu::handle_title_quit,
                 ui::title_hex_grid::animate_title_hex_tiles,
-                style_menu_buttons,
+                title_menu::style_title_menu_buttons,
                 handle_toggle_button,
             )
                 .run_if(in_state(AppState::MainMenu))
                 .before(UiSystem::Layout),
+        )
+        .add_systems(
+            PostUpdate,
+            title_menu::animate_title_menu_hover
+                .run_if(in_state(AppState::MainMenu))
+                .after(UiSystem::Layout),
         )
         .add_systems(
             Update,

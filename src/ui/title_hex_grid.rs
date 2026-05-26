@@ -6,17 +6,27 @@ use bevy::window::PrimaryWindow;
 
 use crate::app_state::AppState;
 use crate::hexgrid::{axial_to_pixel, hex_corners_local, hex_disk};
-use crate::ui::GOLD;
+use crate::ui::{smooth_follow, GOLD};
 
 pub const MENU_HEX_SIZE: f32 = 22.0;
 pub const MENU_GRID_RADIUS: i32 = 18;
 const LAYOUT_SPACING: f32 = 1.48;
-const MOUSE_INFLUENCE_RADIUS: f32 = 260.0;
-const MAX_SCALE_BOOST: f32 = 1.1;
-const MOUSE_PULL: f32 = 0.18;
+const MOUSE_INFLUENCE_RADIUS: f32 = 340.0;
+const HEX_SCALE_SMOOTH: f32 = 5.5;
 
 #[derive(Component)]
 pub struct TitleHexGrid;
+
+#[derive(Component)]
+pub(crate) struct TitleHexTileMotion {
+    scale: f32,
+}
+
+impl TitleHexTileMotion {
+    fn new() -> Self {
+        Self { scale: 1.0 }
+    }
+}
 
 #[derive(Component)]
 pub(crate) struct TitleHexTile {
@@ -43,6 +53,7 @@ pub fn spawn_title_hex_grid(
         commands
             .spawn((
                 TitleHexTile { base },
+                TitleHexTileMotion::new(),
                 TitleHexGrid,
                 Transform::from_xyz(base.x, base.y, 0.0),
                 Visibility::Visible,
@@ -102,17 +113,41 @@ fn screen_to_world(cam: &GlobalTransform, window_size: Vec2, screen_pos: Vec2, z
 
 fn mouse_influence(dist: f32) -> f32 {
     let t = (1.0 - dist / MOUSE_INFLUENCE_RADIUS).clamp(0.0, 1.0);
-    t * t * (3.0 - 2.0 * t)
+    t * t * t * (t * (t * 6.0 - 15.0) + 10.0)
+}
+
+fn max_tiling_scale() -> f32 {
+    let layout_size = MENU_HEX_SIZE * LAYOUT_SPACING;
+    let circumradius = hex_corners_local(MENU_HEX_SIZE)
+        .iter()
+        .map(|&(x, y)| (x * x + y * y).sqrt())
+        .fold(0.0_f32, f32::max);
+    let (nx, ny) = axial_to_pixel(1, 0, layout_size);
+    let neighbor_dist = (nx * nx + ny * ny).sqrt();
+    neighbor_dist / (circumradius * 3.0_f32.sqrt())
+}
+
+fn target_hex_scale(influence: f32) -> f32 {
+    let max_scale = max_tiling_scale();
+    1.0 + (max_scale - 1.0) * influence
 }
 
 pub fn animate_title_hex_tiles(
+    time: Res<Time>,
     window: Query<&Window, With<PrimaryWindow>>,
     camera: Query<(&GlobalTransform, &OrthographicProjection), With<Camera2d>>,
-    mut tiles: Query<(&TitleHexTile, &mut Transform), With<TitleHexGrid>>,
-) {    let Ok(window) = window.get_single() else {
+    mut tiles: Query<(&TitleHexTile, &mut TitleHexTileMotion, &mut Transform), With<TitleHexGrid>>,
+) {
+    let dt = time.delta_secs();
+    let Ok(window) = window.get_single() else {
         return;
     };
     let Some(cursor) = window.cursor_position() else {
+        for (tile, mut motion, mut transform) in &mut tiles {
+            motion.scale = smooth_follow(motion.scale, 1.0, dt, HEX_SCALE_SMOOTH);
+            transform.translation = Vec3::new(tile.base.x, tile.base.y, 0.0);
+            transform.scale = Vec3::splat(motion.scale);
+        }
         return;
     };
     let Ok((cam, proj)) = camera.get_single() else {
@@ -122,19 +157,14 @@ pub fn animate_title_hex_tiles(
     let ws = Vec2::new(window.width(), window.height());
     let mouse = screen_to_world(cam, ws, cursor, proj.scale);
 
-    for (tile, mut transform) in &mut tiles {
-        let delta = mouse - tile.base;
-        let dist = delta.length();
+    for (tile, mut motion, mut transform) in &mut tiles {
+        let dist = (mouse - tile.base).length();
         let influence = mouse_influence(dist);
-        let scale = 1.0 + MAX_SCALE_BOOST * influence;
-        let pull = if dist > 0.5 {
-            delta / dist * (dist * MOUSE_PULL * influence)
-        } else {
-            Vec2::ZERO
-        };
-        let pos = tile.base + pull;
-        transform.translation = Vec3::new(pos.x, pos.y, 0.0);
-        transform.scale = Vec3::splat(scale);
+        let target_scale = target_hex_scale(influence);
+
+        motion.scale = smooth_follow(motion.scale, target_scale, dt, HEX_SCALE_SMOOTH);
+        transform.translation = Vec3::new(tile.base.x, tile.base.y, 0.0);
+        transform.scale = Vec3::splat(motion.scale);
     }
 }
 
