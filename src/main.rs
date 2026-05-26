@@ -1,3 +1,4 @@
+mod center_island;
 mod game;
 mod hexgrid;
 mod map;
@@ -699,6 +700,8 @@ fn terrain_to_color(t: TerrainType) -> Color {
         TerrainType::BlightedWaste => Color::srgb_u8(0x3a, 0x1a, 0x4a),
         TerrainType::RuinField => Color::srgb_u8(0x5a, 0x4a, 0x38),
         TerrainType::SacredGround => Color::srgb_u8(0xc8, 0xa8, 0x30),
+        TerrainType::Cinderfield => Color::srgb_u8(0xb5, 0x47, 0x1c),
+        TerrainType::Rootfield => Color::srgb_u8(0x1b, 0x6b, 0x45),
     }
 }
 
@@ -1094,12 +1097,17 @@ fn terrain_label(t: TerrainType) -> &'static str {
         TerrainType::BlightedWaste => "Blighted Waste",
         TerrainType::RuinField => "Ruin Field",
         TerrainType::SacredGround => "Sacred Ground",
+        TerrainType::Cinderfield => "Cinderfield",
+        TerrainType::Rootfield => "Rootfield",
     }
 }
 
 fn terrain_category(t: TerrainType) -> Option<&'static str> {
     match t {
-        TerrainType::Plains | TerrainType::Greenfield => Some("Base"),
+        TerrainType::Plains
+        | TerrainType::Greenfield
+        | TerrainType::Cinderfield
+        | TerrainType::Rootfield => Some("Base"),
         TerrainType::DeepOcean
         | TerrainType::Ocean
         | TerrainType::Coast
