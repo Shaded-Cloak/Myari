@@ -1,3 +1,4 @@
+mod app_state;
 mod center_island;
 mod game;
 mod hexgrid;
@@ -6,6 +7,7 @@ mod outer_islands;
 mod rng;
 mod ui;
 
+use app_state::{AppState, InGameHud, LoadingJob, LoadingProgress};
 use bevy::color::Color;
 use bevy::input::keyboard::KeyCode;
 use bevy::input::mouse::MouseButton;
@@ -13,6 +15,7 @@ use bevy::prelude::*;
 use bevy::render::mesh::Indices;
 use bevy::render::render_resource::PrimitiveTopology;
 use bevy::window::{MonitorSelection, PrimaryWindow, WindowMode};
+use bevy::ui::UiSystem;
 use bevy_pancam::{PanCam, PanCamPlugin};
 use rand::Rng;
 use std::collections::HashSet;
@@ -21,11 +24,19 @@ use game::GameState;
 use crate::hexgrid::{axial_to_pixel, hex_corners_at, hex_corners_local, pixel_to_hex, HexCoord};
 use map::{Map, HexTile, TerrainType, MAP_RADIUS};
 use ui::{
-    menu_button_bundle, spawn_framed_panel, spawn_ornate_divider, spawn_star_watermark, HudAnchor,
-    UiTheme, BTN_HOVER, BTN_IDLE, BTN_PRESSED, GEM_FRAME, GOLD, GOLD_DIM, PARCHMENT,
+    loading_screen::{spawn_loading_screen, sync_loading_ui, LoadingRoot},
+    menu_button_row_bundle, menu_panel_intro_transform, menu_panel_outro_transform,
+    menu_framed_overlay, menu_panel_bundle, spawn_framed_panel, spawn_menu_button_label,
+    spawn_ornate_divider, spawn_star_watermark, title_menu::{
+        self, spawn_title_menu, sync_title_subscreen, TitleRoot, TitleScreen,
+    },
+    ease_out_cubic, HudAnchor, MenuButton, UiTheme, BTN_HOVER, BTN_IDLE, BTN_PRESSED,
+    GEM_FRAME, GOLD, MENU_BACKDROP, MENU_ENTER_SECS, MENU_EXIT_SECS, MENU_SWITCH_SECS,
 };
 
 const HEX_SIZE: f32 = 28.0;
+const MIN_LOAD_SECS: f32 = 1.0;
+const LOAD_INTRO_SECS: f32 = 0.35;
 
 fn main() {
     println!("Myari starting up...");
@@ -39,37 +50,80 @@ fn main() {
             ..default()
         }))
         .add_plugins(PanCamPlugin)
+        .init_state::<AppState>()
         .init_resource::<SelectedHex>()
         .init_resource::<HoveredHex>()
         .init_resource::<FpsCounter>()
         .init_resource::<GridVisible>()
-        .init_resource::<MenuOpen>()
+        .init_resource::<MenuScreen>()
+        .init_resource::<MenuMotion>()
         .init_resource::<Zoom>()
         .init_resource::<CurrentSeed>()
         .init_resource::<SavePath>()
+        .init_resource::<LoadingJob>()
+        .init_resource::<LoadingProgress>()
+        .init_resource::<TitleScreen>()
+        .init_resource::<InGameUiReady>()
+        .insert_resource(ClearColor(Color::srgb(0.02, 0.02, 0.03)))
         .add_systems(Startup, (setup_camera, setup_ui_theme))
         .add_systems(
             Startup,
-            (spawn_map_and_game, fps_startup, spawn_menu).after(setup_ui_theme),
+            (
+                init_save_path,
+                spawn_title_menu,
+                ui::title_hex_grid::spawn_title_hex_grid,
+                spawn_loading_screen,
+                spawn_pause_menu,
+            )
+                .after(setup_ui_theme),
+        )
+        .add_systems(Update, (sync_app_screens, sync_pancam, ui::title_hex_grid::sync_title_hex_grid_visibility))
+        .add_systems(
+            Update,
+            (
+                sync_title_subscreen,
+                title_menu::handle_title_play,
+                title_menu::handle_title_continue,
+                title_menu::handle_title_settings,
+                title_menu::handle_title_back,
+                title_menu::handle_title_quit,
+                ui::title_hex_grid::animate_title_hex_tiles,
+                style_menu_buttons,
+                handle_toggle_button,
+            )
+                .run_if(in_state(AppState::MainMenu))
+                .before(UiSystem::Layout),
+        )
+        .add_systems(
+            Update,
+            (loading_pipeline, sync_loading_ui).run_if(in_state(AppState::Loading)),
+        )
+        .add_systems(
+            Update,
+            sync_zoom_from_camera.run_if(in_state(AppState::InGame)),
         )
         .add_systems(
             Update,
             (
-                sync_pancam,
-                sync_zoom_from_camera,
                 track_hover,
                 highlight_hover,
                 update_hover_panel,
                 handle_selection,
                 move_selected_unit,
-                toggle_menu,
+                on_menu_screen_changed,
+                update_menu_motion,
+                handle_menu_escape,
+                handle_resume_button,
+                style_menu_buttons,
+                handle_open_settings_button,
                 handle_toggle_button,
                 fps_update,
                 end_turn,
                 reroll_world,
                 save_game,
                 load_game,
-            ),
+            )
+                .run_if(in_state(AppState::InGame)),
         )
         .run();
 }
@@ -111,8 +165,33 @@ struct GridMaterial(Handle<ColorMaterial>);
 #[derive(Resource, Default)]
 struct GridVisible(bool);
 
+#[derive(Resource, Default, PartialEq, Eq, Clone, Copy)]
+enum MenuScreen {
+    #[default]
+    Closed,
+    Main,
+    Settings,
+}
+
+#[derive(Default, PartialEq, Eq, Clone, Copy)]
+enum MenuMotionPhase {
+    #[default]
+    Idle,
+    Enter,
+    Exit,
+    Switch,
+}
+
 #[derive(Resource, Default)]
-struct MenuOpen(bool);
+struct MenuMotion {
+    phase: MenuMotionPhase,
+    timer: f32,
+    duration: f32,
+    /// Panel fading out during Exit.
+    exit_panel: MenuScreen,
+    /// Panel easing in during Enter / Switch.
+    intro_panel: MenuScreen,
+}
 
 #[derive(Resource)]
 struct Zoom(f32);
@@ -125,10 +204,25 @@ impl Default for Zoom {
 struct MenuRoot;
 
 #[derive(Component)]
-struct GridToggle;
+struct PauseHomePanel;
 
 #[derive(Component)]
-struct GridToggleLabel;
+struct SettingsMenuPanel;
+
+#[derive(Component)]
+struct OpenSettingsButton;
+
+#[derive(Component)]
+struct ResumeButton;
+
+#[derive(Resource, Default)]
+struct InGameUiReady(bool);
+
+#[derive(Component)]
+pub struct GridToggle;
+
+#[derive(Component)]
+pub struct GridToggleLabel;
 
 #[derive(Component)]
 struct GridMarker;
@@ -191,9 +285,16 @@ fn setup_camera(mut commands: Commands) {
     ));
 }
 
-fn sync_pancam(menu: Res<MenuOpen>, mut cameras: Query<&mut PanCam>) {
+fn sync_pancam(
+    app_state: Res<State<AppState>>,
+    screen: Res<MenuScreen>,
+    motion: Res<MenuMotion>,
+    mut cameras: Query<&mut PanCam>,
+) {
     if let Ok(mut pan) = cameras.get_single_mut() {
-        pan.enabled = !menu.0;
+        let pause_visible =
+            *screen != MenuScreen::Closed || motion.phase == MenuMotionPhase::Exit;
+        pan.enabled = *app_state.get() == AppState::InGame && !pause_visible;
     }
 }
 
@@ -206,39 +307,170 @@ fn sync_zoom_from_camera(
     }
 }
 
-fn spawn_map_and_game(
+fn init_save_path(mut save_path: ResMut<SavePath>) {
+    save_path.0 = Some(default_save_path());
+}
+
+pub fn default_save_path() -> String {
+    let base = std::env::var("LOCALAPPDATA")
+        .or_else(|_| std::env::var("APPDATA"))
+        .unwrap_or_else(|_| ".".to_string());
+    format!("{base}\\Myari\\save.json")
+}
+
+fn sync_app_screens(
+    app_state: Res<State<AppState>>,
+    mut title: Query<&mut Node, With<TitleRoot>>,
+    mut loading: Query<&mut Node, (With<LoadingRoot>, Without<TitleRoot>)>,
+    mut pause: Query<&mut Node, (With<MenuRoot>, Without<TitleRoot>, Without<LoadingRoot>)>,
+    mut hud: Query<&mut Visibility, With<InGameHud>>,
+) {
+    if !app_state.is_changed() {
+        return;
+    }
+    let state = app_state.get();
+    if let Ok(mut node) = title.get_single_mut() {
+        node.display = if *state == AppState::MainMenu {
+            Display::Flex
+        } else {
+            Display::None
+        };
+    }
+    if let Ok(mut node) = loading.get_single_mut() {
+        node.display = if *state == AppState::Loading {
+            Display::Flex
+        } else {
+            Display::None
+        };
+    }
+    if let Ok(mut node) = pause.get_single_mut() {
+        if *state != AppState::InGame {
+            node.display = Display::None;
+        }
+    }
+    let hud_vis = if *state == AppState::InGame {
+        Visibility::Visible
+    } else {
+        Visibility::Hidden
+    };
+    for mut vis in &mut hud {
+        *vis = hud_vis;
+    }
+}
+
+fn loading_pipeline(
+    time: Res<Time>,
+    job: Res<LoadingJob>,
+    mut progress: ResMut<LoadingProgress>,
+    mut next_state: ResMut<NextState<AppState>>,
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<ColorMaterial>>,
     mut seed_res: ResMut<CurrentSeed>,
-    mut save_path: ResMut<SavePath>,
     theme: Res<UiTheme>,
+    mut ui_ready: ResMut<InGameUiReady>,
+    game_state: Option<Res<GameState>>,
+    mut text_queries: ParamSet<(
+        Query<&mut Text, With<TurnText>>,
+        Query<&mut Text, With<SeedText>>,
+    )>,
 ) {
-    println!("spawn_map_and_game called");
-    save_path.0 = Some(default_save_path());
-    let seed = rand::thread_rng().gen::<u64>();
-    seed_res.0 = seed;
-    println!("World seed: {seed}");
+    progress.timer += time.delta_secs();
 
-    let (map, gs) = spawn_world_entities(&mut commands, &mut meshes, &mut materials, seed);
-    commands.insert_resource(GameMap(map));
-    commands.insert_resource(gs);
+    match progress.step {
+        0 => {
+            progress.status = "Preparing…".to_string();
+            progress.bar = 0.1;
+            if progress.timer >= LOAD_INTRO_SECS {
+                progress.step = 1;
+            }
+        }
+        1 if !progress.work_done => {
+            progress.status = match *job {
+                LoadingJob::NewGame => "Generating world…".to_string(),
+                LoadingJob::Continue => "Loading save…".to_string(),
+                LoadingJob::None => "Working…".to_string(),
+            };
+            progress.bar = 0.55;
 
-    spawn_game_hud(&mut commands, &theme, seed);
+            let (map, gs, seed) = match *job {
+                LoadingJob::NewGame => {
+                    let seed = rand::thread_rng().gen::<u64>();
+                    let map = Map::generate(MAP_RADIUS, seed);
+                    let gs = GameState::new(&map);
+                    (map, gs, seed)
+                }
+                LoadingJob::Continue => match load_saved_game() {
+                    Ok(data) => {
+                        let map = Map::from_tiles(data.tiles);
+                        (map, data.game_state, data.seed)
+                    }
+                    Err(_) => {
+                        progress.status = "Failed to load save".to_string();
+                        progress.step = 3;
+                        progress.bar = 1.0;
+                        return;
+                    }
+                },
+                LoadingJob::None => return,
+            };
 
-    // Hover highlight entity (single hex outline)
-    let hm = meshes.add(make_hex_outline_mesh(HEX_SIZE));
-    commands.spawn((
-        Mesh2d(hm),
-        MeshMaterial2d(materials.add(ColorMaterial::from_color(Color::srgba(
-            0.05, 0.95, 1.0, 1.0,
-        )))),
-        Transform::from_xyz(0.0, 0.0, 5.0),
-        Visibility::Hidden,
-        Highlight,
-    ));
+            seed_res.0 = seed;
+            spawn_world_visuals(&mut commands, &mut meshes, &mut materials, &map, &gs);
+            commands.insert_resource(GameMap(map));
+            commands.insert_resource(gs);
 
-    spawn_hover_panel(&mut commands, &theme);
+            progress.work_done = true;
+            progress.step = 2;
+            progress.bar = 0.85;
+        }
+        2 if !progress.ui_done => {
+            progress.status = "Placing civilizations…".to_string();
+            progress.bar = 0.9;
+
+            if !ui_ready.0 {
+                fps_startup(&mut commands, &theme);
+                spawn_game_hud(&mut commands, &theme, seed_res.0);
+                spawn_hover_panel(&mut commands, &theme);
+                let hm = meshes.add(make_hex_outline_mesh(HEX_SIZE));
+                commands.spawn((
+                    Mesh2d(hm),
+                    MeshMaterial2d(materials.add(ColorMaterial::from_color(Color::srgba(
+                        0.05, 0.95, 1.0, 1.0,
+                    )))),
+                    Transform::from_xyz(0.0, 0.0, 5.0),
+                    Visibility::Hidden,
+                    Highlight,
+                    InGameHud,
+                ));
+                ui_ready.0 = true;
+            }
+
+            if let Some(gs) = game_state.as_ref() {
+                if let Ok(mut text) = text_queries.p0().get_single_mut() {
+                    text.0 = gs.turn.to_string();
+                }
+            }
+            if let Ok(mut text) = text_queries.p1().get_single_mut() {
+                text.0 = seed_res.0.to_string();
+            }
+
+            progress.ui_done = true;
+            progress.step = 3;
+            progress.status = "Ready".to_string();
+            progress.bar = 1.0;
+        }
+        3 if progress.timer >= MIN_LOAD_SECS => {
+            next_state.set(AppState::InGame);
+        }
+        _ => {}
+    }
+}
+
+fn load_saved_game() -> Result<SaveData, ()> {
+    let path = default_save_path();
+    let text = std::fs::read_to_string(&path).map_err(|_| ())?;
+    serde_json::from_str(&text).map_err(|_| ())
 }
 
 fn spawn_game_hud(commands: &mut Commands, theme: &UiTheme, seed: u64) {
@@ -396,13 +628,6 @@ fn terrain_swatch_color(t: TerrainType) -> Color {
     )
 }
 
-fn default_save_path() -> String {
-    let base = std::env::var("LOCALAPPDATA")
-        .or_else(|_| std::env::var("APPDATA"))
-        .unwrap_or_else(|_| ".".to_string());
-    format!("{base}\\Myari\\save.json")
-}
-
 #[derive(serde::Serialize, serde::Deserialize)]
 struct SaveData {
     seed: u64,
@@ -456,13 +681,8 @@ fn load_game(
     if !keys.just_pressed(KeyCode::F9) {
         return;
     }
-    let path = default_save_path();
-    let Ok(text) = std::fs::read_to_string(&path) else {
-        println!("No save found at: {path}");
-        return;
-    };
-    let Ok(data) = serde_json::from_str::<SaveData>(&text) else {
-        println!("Failed to parse save at: {path}");
+    let Ok(data) = load_saved_game() else {
+        println!("No save found or failed to parse save");
         return;
     };
 
@@ -482,7 +702,7 @@ fn load_game(
     if let Ok(mut text) = text_queries.p1().get_single_mut() {
         text.0 = data.seed.to_string();
     }
-    println!("Loaded game from: {path}");
+    println!("Loaded game from: {}", default_save_path());
 }
 
 fn spawn_world_visuals(
@@ -702,6 +922,9 @@ fn terrain_to_color(t: TerrainType) -> Color {
         TerrainType::SacredGround => Color::srgb_u8(0xc8, 0xa8, 0x30),
         TerrainType::Cinderfield => Color::srgb_u8(0xb5, 0x47, 0x1c),
         TerrainType::Rootfield => Color::srgb_u8(0x1b, 0x6b, 0x45),
+        TerrainType::Duskwood => Color::srgb_u8(0x2d, 0x4a, 0x2a),
+        TerrainType::Frostpine => Color::srgb_u8(0x2a, 0x3d, 0x4a),
+        TerrainType::Ashgrove => Color::srgb_u8(0x9a, 0x50, 0x20),
     }
 }
 
@@ -809,10 +1032,10 @@ fn move_selected_unit(
 
 // ── FPS counter ─────────────────────────────────────────────────
 
-fn fps_startup(mut commands: Commands, theme: Res<UiTheme>) {
+fn fps_startup(commands: &mut Commands, theme: &UiTheme) {
     spawn_framed_panel(
-        &mut commands,
-        &theme,
+        commands,
+        theme,
         HudAnchor::TopLeft {
             left: 18.0,
             top: 18.0,
@@ -844,9 +1067,9 @@ fn fps_update(
     }
 }
 
-// ── Settings Menu ───────────────────────────────────────────────
+// ── Pause menu (Esc, in-game only) ──────────────────────────────
 
-fn spawn_menu(mut commands: Commands, theme: Res<UiTheme>) {
+fn spawn_pause_menu(mut commands: Commands, theme: Res<UiTheme>) {
     commands
         .spawn((
             Node {
@@ -860,62 +1083,283 @@ fn spawn_menu(mut commands: Commands, theme: Res<UiTheme>) {
                 align_items: AlignItems::Center,
                 ..default()
             },
-            BackgroundColor(Color::srgba(0.02, 0.02, 0.03, 0.72)),
+            BackgroundColor(MENU_BACKDROP),
             MenuRoot,
         ))
         .with_children(|overlay| {
             overlay
                 .spawn((
                     Node {
-                        padding: UiRect::all(Val::Px(3.0)),
-                        border: UiRect::all(Val::Px(2.0)),
+                        display: Display::None,
                         ..default()
                     },
-                    BackgroundColor(PARCHMENT),
-                    BorderColor(GOLD),
+                    PauseHomePanel,
                 ))
-                .with_children(|frame| {
-                    frame
-                        .spawn((
-                            Node {
-                                width: Val::Px(320.0),
-                                flex_direction: FlexDirection::Column,
-                                padding: UiRect::new(
-                                    Val::Px(22.0),
-                                    Val::Px(20.0),
-                                    Val::Px(20.0),
-                                    Val::Px(22.0),
-                                ),
-                                row_gap: Val::Px(16.0),
-                                align_items: AlignItems::Center,
-                                border: UiRect::all(Val::Px(1.0)),
-                                ..default()
-                            },
-                            BackgroundColor(ui::PANEL),
-                            BorderColor(GOLD_DIM),
-                        ))
-                        .with_children(|panel| {
-                            panel.spawn(theme.value("SETTINGS", 26.0));
-                            spawn_ornate_divider(panel, &theme);
+                .with_children(|main| {
+                    menu_framed_overlay(main, &theme, |frame, theme| {
+                        frame.spawn(menu_panel_bundle(320.0)).with_children(|panel| {
+                            panel.spawn(theme.value("PAUSED", 26.0));
+                            spawn_ornate_divider(panel, theme);
                             panel
-                                .spawn((menu_button_bundle(), GridToggle))
+                                .spawn((
+                                    menu_button_row_bundle(),
+                                    MenuButton,
+                                    ResumeButton,
+                                ))
                                 .with_children(|btn| {
-                                    btn.spawn((
-                                        theme.value("Grid: OFF", 17.0),
-                                        GridToggleLabel,
-                                    ));
+                                    spawn_menu_button_label(btn, theme, "Resume", ());
+                                });
+                            panel
+                                .spawn((
+                                    menu_button_row_bundle(),
+                                    MenuButton,
+                                    OpenSettingsButton,
+                                ))
+                                .with_children(|btn| {
+                                    spawn_menu_button_label(btn, theme, "Settings", ());
                                 });
                             panel.spawn(theme.hint("ESC — Close menu", 12.0));
                         });
+                    });
+                });
+
+            overlay
+                .spawn((
+                    Node {
+                        display: Display::None,
+                        ..default()
+                    },
+                    SettingsMenuPanel,
+                ))
+                .with_children(|settings| {
+                    menu_framed_overlay(settings, &theme, |frame, theme| {
+                        frame.spawn(menu_panel_bundle(320.0)).with_children(|panel| {
+                            panel.spawn(theme.value("SETTINGS", 26.0));
+                            spawn_ornate_divider(panel, theme);
+                            panel
+                                .spawn((
+                                    menu_button_row_bundle(),
+                                    MenuButton,
+                                    GridToggle,
+                                ))
+                                .with_children(|btn| {
+                                    spawn_menu_button_label(btn, theme, "Grid: OFF", GridToggleLabel);
+                                });
+                            panel.spawn(theme.hint("ESC — Back", 12.0));
+                        });
+                    });
                 });
         });
 }
 
-fn toggle_menu(
+fn on_menu_screen_changed(
+    screen: Res<MenuScreen>,
+    mut motion: ResMut<MenuMotion>,
+    mut last: Local<MenuScreen>,
+    mut overlay: Query<&mut Node, (With<MenuRoot>, Without<PauseHomePanel>, Without<SettingsMenuPanel>)>,
+    mut main: Query<&mut Node, (With<PauseHomePanel>, Without<MenuRoot>, Without<SettingsMenuPanel>)>,
+    mut settings: Query<
+        &mut Node,
+        (With<SettingsMenuPanel>, Without<MenuRoot>, Without<PauseHomePanel>),
+    >,
+    mut main_xform: Query<
+        &mut Transform,
+        (With<PauseHomePanel>, Without<MenuRoot>, Without<SettingsMenuPanel>),
+    >,
+    mut settings_xform: Query<
+        &mut Transform,
+        (With<SettingsMenuPanel>, Without<MenuRoot>, Without<PauseHomePanel>),
+    >,
+    mut overlay_bg: Query<
+        &mut BackgroundColor,
+        (With<MenuRoot>, Without<PauseHomePanel>, Without<SettingsMenuPanel>),
+    >,
+) {
+    if *last == *screen {
+        return;
+    }
+    let prev = *last;
+    *last = *screen;
+
+    motion.timer = 0.0;
+    match (prev, *screen) {
+        (_, MenuScreen::Closed) => {
+            motion.phase = MenuMotionPhase::Exit;
+            motion.duration = MENU_EXIT_SECS;
+            motion.exit_panel = prev;
+        }
+        (MenuScreen::Closed, MenuScreen::Main) => {
+            motion.phase = MenuMotionPhase::Enter;
+            motion.duration = MENU_ENTER_SECS;
+            motion.intro_panel = MenuScreen::Main;
+        }
+        (MenuScreen::Main, MenuScreen::Settings) | (MenuScreen::Settings, MenuScreen::Main) => {
+            motion.phase = MenuMotionPhase::Switch;
+            motion.duration = MENU_SWITCH_SECS;
+            motion.intro_panel = *screen;
+        }
+        _ => {
+            motion.phase = MenuMotionPhase::Idle;
+        }
+    }
+
+    let show_overlay = *screen != MenuScreen::Closed || motion.phase == MenuMotionPhase::Exit;
+    if let Ok(mut node) = overlay.get_single_mut() {
+        node.display = if show_overlay {
+            Display::Flex
+        } else {
+            Display::None
+        };
+    }
+
+    let show_main = *screen == MenuScreen::Main
+        || (motion.phase == MenuMotionPhase::Exit && motion.exit_panel == MenuScreen::Main);
+    let show_settings = *screen == MenuScreen::Settings
+        || (motion.phase == MenuMotionPhase::Exit && motion.exit_panel == MenuScreen::Settings);
+
+    if let Ok(mut node) = main.get_single_mut() {
+        node.display = if show_main {
+            Display::Flex
+        } else {
+            Display::None
+        };
+    }
+    if let Ok(mut node) = settings.get_single_mut() {
+        node.display = if show_settings {
+            Display::Flex
+        } else {
+            Display::None
+        };
+    }
+
+    if motion.phase == MenuMotionPhase::Enter {
+        if let Ok(mut bg) = overlay_bg.get_single_mut() {
+            bg.0 = Color::srgba(0.02, 0.02, 0.03, 0.0);
+        }
+        if let Ok(mut xform) = main_xform.get_single_mut() {
+            *xform = menu_panel_intro_transform(0.0);
+        }
+    } else if motion.phase == MenuMotionPhase::Switch {
+        let xform = if motion.intro_panel == MenuScreen::Main {
+            main_xform.get_single_mut()
+        } else {
+            settings_xform.get_single_mut()
+        };
+        if let Ok(mut xform) = xform {
+            *xform = menu_panel_intro_transform(0.0);
+        }
+    }
+}
+
+fn update_menu_motion(
+    time: Res<Time>,
+    mut motion: ResMut<MenuMotion>,
+    mut overlay: Query<&mut Node, (With<MenuRoot>, Without<PauseHomePanel>, Without<SettingsMenuPanel>)>,
+    mut main: Query<&mut Node, (With<PauseHomePanel>, Without<MenuRoot>, Without<SettingsMenuPanel>)>,
+    mut settings: Query<
+        &mut Node,
+        (With<SettingsMenuPanel>, Without<MenuRoot>, Without<PauseHomePanel>),
+    >,
+    mut overlay_bg: Query<
+        &mut BackgroundColor,
+        (With<MenuRoot>, Without<PauseHomePanel>, Without<SettingsMenuPanel>),
+    >,
+    mut main_xform: Query<
+        &mut Transform,
+        (With<PauseHomePanel>, Without<MenuRoot>, Without<SettingsMenuPanel>),
+    >,
+    mut settings_xform: Query<
+        &mut Transform,
+        (With<SettingsMenuPanel>, Without<MenuRoot>, Without<PauseHomePanel>),
+    >,
+) {
+    if motion.phase == MenuMotionPhase::Idle {
+        return;
+    }
+
+    motion.timer += time.delta_secs();
+    let raw_t = (motion.timer / motion.duration).min(1.0);
+
+    match motion.phase {
+        MenuMotionPhase::Enter => {
+            let t = ease_out_cubic(raw_t);
+            if let Ok(mut bg) = overlay_bg.get_single_mut() {
+                bg.0 = Color::srgba(0.02, 0.02, 0.03, MENU_BACKDROP.alpha() * t);
+            }
+            if let Ok(mut xform) = main_xform.get_single_mut() {
+                *xform = menu_panel_intro_transform(raw_t);
+            }
+        }
+        MenuMotionPhase::Switch => {
+            let xform = if motion.intro_panel == MenuScreen::Main {
+                main_xform.get_single_mut()
+            } else {
+                settings_xform.get_single_mut()
+            };
+            if let Ok(mut xform) = xform {
+                *xform = menu_panel_intro_transform(raw_t);
+            }
+        }
+        MenuMotionPhase::Exit => {
+            let t = ease_out_cubic(raw_t);
+            if let Ok(mut bg) = overlay_bg.get_single_mut() {
+                bg.0 = Color::srgba(0.02, 0.02, 0.03, MENU_BACKDROP.alpha() * (1.0 - t));
+            }
+            let xform = if motion.exit_panel == MenuScreen::Main {
+                main_xform.get_single_mut()
+            } else {
+                settings_xform.get_single_mut()
+            };
+            if let Ok(mut xform) = xform {
+                *xform = menu_panel_outro_transform(raw_t);
+            }
+        }
+        MenuMotionPhase::Idle => {}
+    }
+
+    if motion.timer < motion.duration {
+        return;
+    }
+
+    match motion.phase {
+        MenuMotionPhase::Enter | MenuMotionPhase::Switch => {
+            if let Ok(mut xform) = main_xform.get_single_mut() {
+                *xform = Transform::default();
+            }
+            if let Ok(mut xform) = settings_xform.get_single_mut() {
+                *xform = Transform::default();
+            }
+            if let Ok(mut bg) = overlay_bg.get_single_mut() {
+                bg.0 = MENU_BACKDROP;
+            }
+        }
+        MenuMotionPhase::Exit => {
+            if let Ok(mut bg) = overlay_bg.get_single_mut() {
+                bg.0 = Color::srgba(0.02, 0.02, 0.03, 0.0);
+            }
+            if let Ok(mut node) = overlay.get_single_mut() {
+                node.display = Display::None;
+            }
+            if let Ok(mut node) = main.get_single_mut() {
+                node.display = Display::None;
+            }
+            if let Ok(mut node) = settings.get_single_mut() {
+                node.display = Display::None;
+            }
+            // Leave panel transforms at their outro pose — resetting here caused a
+            // one-frame snap while the overlay was still visible.
+        }
+        MenuMotionPhase::Idle => {}
+    }
+
+    motion.phase = MenuMotionPhase::Idle;
+    motion.timer = 0.0;
+}
+
+fn handle_menu_escape(
     keys: Res<ButtonInput<KeyCode>>,
     time: Res<Time>,
-    mut menu_open: ResMut<MenuOpen>,
-    mut query: Query<&mut Node, With<MenuRoot>>,
+    mut screen: ResMut<MenuScreen>,
     mut was_pressed: Local<bool>,
     mut last_toggle: Local<f32>,
 ) {
@@ -939,53 +1383,74 @@ fn toggle_menu(
     *was_pressed = true;
     *last_toggle = now;
 
-    menu_open.0 = !menu_open.0;
-    if let Ok(mut node) = query.get_single_mut() {
-        node.display = if menu_open.0 {
-            Display::Flex
-        } else {
-            Display::None
+    *screen = match *screen {
+        MenuScreen::Closed => MenuScreen::Main,
+        MenuScreen::Main => MenuScreen::Closed,
+        MenuScreen::Settings => MenuScreen::Main,
+    };
+}
+
+fn style_menu_buttons(
+    mut query: Query<(&Interaction, &mut BackgroundColor), (Changed<Interaction>, With<MenuButton>)>,
+) {
+    for (interaction, mut bg) in &mut query {
+        bg.0 = match *interaction {
+            Interaction::Pressed => BTN_PRESSED,
+            Interaction::Hovered => BTN_HOVER,
+            Interaction::None => BTN_IDLE,
         };
+    }
+}
+
+fn handle_resume_button(
+    mut interaction: Query<&Interaction, (Changed<Interaction>, With<ResumeButton>)>,
+    mut screen: ResMut<MenuScreen>,
+) {
+    for interaction in &mut interaction {
+        if *interaction == Interaction::Pressed {
+            *screen = MenuScreen::Closed;
+        }
+    }
+}
+
+fn handle_open_settings_button(
+    mut query: Query<&Interaction, (Changed<Interaction>, With<OpenSettingsButton>)>,
+    mut screen: ResMut<MenuScreen>,
+) {
+    for interaction in &mut query {
+        if *interaction == Interaction::Pressed {
+            *screen = MenuScreen::Settings;
+        }
     }
 }
 
 fn handle_toggle_button(
     mut interaction_query: Query<
-        (&Interaction, &mut BackgroundColor, &Children),
+        &Interaction,
         (Changed<Interaction>, With<GridToggle>),
     >,
     mut grid_visible: ResMut<GridVisible>,
     mut grid_query: Query<&mut Visibility, With<GridMarker>>,
     mut text_query: Query<&mut Text, With<GridToggleLabel>>,
 ) {
-    for (interaction, mut bg, children) in &mut interaction_query {
-        match *interaction {
-            Interaction::Pressed => {
-                grid_visible.0 = !grid_visible.0;
-                if let Ok(mut vis) = grid_query.get_single_mut() {
-                    *vis = if grid_visible.0 {
-                        Visibility::Visible
-                    } else {
-                        Visibility::Hidden
-                    };
-                }
-                bg.0 = BTN_PRESSED;
-                for &child in children.iter() {
-                    if let Ok(mut text) = text_query.get_mut(child) {
-                        text.0 = if grid_visible.0 {
-                            "Grid: ON".to_string()
-                        } else {
-                            "Grid: OFF".to_string()
-                        };
-                    }
-                }
-            }
-            Interaction::Hovered => {
-                bg.0 = BTN_HOVER;
-            }
-            Interaction::None => {
-                bg.0 = BTN_IDLE;
-            }
+    for interaction in &mut interaction_query {
+        if *interaction != Interaction::Pressed {
+            continue;
+        }
+        grid_visible.0 = !grid_visible.0;
+        if let Ok(mut vis) = grid_query.get_single_mut() {
+            *vis = if grid_visible.0 {
+                Visibility::Visible
+            } else {
+                Visibility::Hidden
+            };
+        }
+        for mut text in &mut text_query {
+            text.0 = if grid_visible.0 {
+                "Grid: ON".to_string()
+            } else {
+                "Grid: OFF".to_string()
+            };
         }
     }
 }
@@ -1099,6 +1564,9 @@ fn terrain_label(t: TerrainType) -> &'static str {
         TerrainType::SacredGround => "Sacred Ground",
         TerrainType::Cinderfield => "Cinderfield",
         TerrainType::Rootfield => "Rootfield",
+        TerrainType::Duskwood => "Duskwood",
+        TerrainType::Frostpine => "Frostpine",
+        TerrainType::Ashgrove => "Ashgrove",
     }
 }
 
@@ -1114,7 +1582,12 @@ fn terrain_category(t: TerrainType) -> Option<&'static str> {
         | TerrainType::Freshwater => Some("Water"),
         TerrainType::SnowPeak | TerrainType::StonySlope => Some("Mountain"),
         TerrainType::Beach => Some("Shore"),
-        TerrainType::Oldwood | TerrainType::Darkpine | TerrainType::Deepjungle => Some("Forest"),
+        TerrainType::Oldwood
+        | TerrainType::Darkpine
+        | TerrainType::Deepjungle
+        | TerrainType::Duskwood
+        | TerrainType::Frostpine
+        | TerrainType::Ashgrove => Some("Forest"),
         _ => None,
     }
 }

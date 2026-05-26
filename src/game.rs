@@ -290,7 +290,10 @@ fn find_best_start(
         let mut score = match tile.terrain {
             TerrainType::Greenfield | TerrainType::Rootfield => 11,
             TerrainType::Plains | TerrainType::Cinderfield => 10,
-            TerrainType::Oldwood => 8,
+            TerrainType::Oldwood
+            | TerrainType::Duskwood
+            | TerrainType::Frostpine
+            | TerrainType::Ashgrove => 8,
             TerrainType::Steppe => 8,
             TerrainType::Deepjungle => 7,
             TerrainType::Darkpine => 7,
@@ -373,6 +376,9 @@ pub fn terrain_yields(terrain: TerrainType) -> Yields {
         TerrainType::Cinderfield => Yields { food: 1, production: 1, gold: 0 },
         TerrainType::Rootfield => Yields { food: 3, production: 0, gold: 0 },
         TerrainType::Oldwood => Yields { food: 1, production: 2, gold: 0 },
+        TerrainType::Duskwood => Yields { food: 1, production: 2, gold: 0 },
+        TerrainType::Frostpine => Yields { food: 1, production: 1, gold: 0 },
+        TerrainType::Ashgrove => Yields { food: 2, production: 0, gold: 1 },
         TerrainType::Snowfield => Yields::default(),
         TerrainType::Frostmoor => Yields { food: 0, production: 1, gold: 0 },
         TerrainType::Darkpine => Yields { food: 1, production: 1, gold: 0 },

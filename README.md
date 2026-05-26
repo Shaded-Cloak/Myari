@@ -10,7 +10,9 @@ From `c:\Users\micah\Myari`:
 cargo run
 ```
 
-## Controls
+Launch opens the **title menu** (Play, Continue, Settings, Quit). Play generates a new world through a loading screen; Continue loads `%LOCALAPPDATA%\\Myari\\save.json` if present.
+
+## Controls (in-game)
 
 - Left-drag: Pan camera
 - Mouse wheel: Zoom
@@ -19,7 +21,7 @@ cargo run
 - M: Move selected player scout to hovered adjacent hex (consumes 1 move)
 - Enter: End turn
 - R: Reroll world (new seed)
-- Esc: Settings menu (grid toggle)
+- Esc: Pause menu (Resume / Settings; Esc again to close or go back)
 - F5: Save
 - F9: Load
 

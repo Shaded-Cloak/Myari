@@ -3,6 +3,13 @@
 use bevy::hierarchy::ChildBuilder;
 use bevy::prelude::*;
 
+use crate::app_state::InGameHud;
+
+pub mod loading_screen;
+pub mod title_constellations;
+pub mod title_hex_grid;
+pub mod title_menu;
+
 pub const FONT_PATH: &str = "fonts/Cinzel-Regular.ttf";
 pub const SYMBOL_FONT_PATH: &str = "fonts/NotoSansSymbols2-Regular.ttf";
 pub const STAR: &str = "✦";
@@ -17,6 +24,36 @@ pub const HINT: Color = Color::srgba(0.75, 0.62, 0.38, 0.55);
 pub const BTN_IDLE: Color = Color::srgba(0.10, 0.08, 0.06, 0.95);
 pub const BTN_HOVER: Color = Color::srgba(0.16, 0.12, 0.08, 0.98);
 pub const BTN_PRESSED: Color = Color::srgba(0.22, 0.16, 0.10, 1.0);
+
+pub const MENU_BACKDROP: Color = Color::srgba(0.02, 0.02, 0.03, 0.72);
+pub const MENU_ENTER_SECS: f32 = 0.22;
+pub const MENU_EXIT_SECS: f32 = 0.14;
+pub const MENU_SWITCH_SECS: f32 = 0.15;
+const MENU_PANEL_START_SCALE: f32 = 0.97;
+const MENU_PANEL_START_Y: f32 = -10.0;
+
+pub fn ease_out_cubic(t: f32) -> f32 {
+    let t = t.clamp(0.0, 1.0);
+    1.0 - (1.0 - t).powi(3)
+}
+
+pub fn menu_panel_intro_transform(t: f32) -> Transform {
+    let eased = ease_out_cubic(t);
+    Transform {
+        translation: Vec3::new(0.0, MENU_PANEL_START_Y * (1.0 - eased), 0.0),
+        scale: Vec3::splat(MENU_PANEL_START_SCALE + (1.0 - MENU_PANEL_START_SCALE) * eased),
+        ..default()
+    }
+}
+
+pub fn menu_panel_outro_transform(t: f32) -> Transform {
+    let eased = ease_out_cubic(t);
+    Transform {
+        translation: Vec3::new(0.0, -4.0 * eased, 0.0),
+        scale: Vec3::splat(1.0 - 0.015 * eased),
+        ..default()
+    }
+}
 
 #[derive(Resource, Clone)]
 pub struct UiTheme {
@@ -128,6 +165,7 @@ pub fn spawn_framed_panel(
             anchor.outer_node(),
             BackgroundColor(PARCHMENT),
             BorderColor(GOLD),
+            InGameHud,
         ))
         .with_children(|frame| {
             frame
@@ -146,6 +184,40 @@ pub fn spawn_framed_panel(
                 ))
                 .with_children(|panel| fill(panel, theme));
         });
+}
+
+pub fn menu_panel_bundle(width: f32) -> impl Bundle {
+    (
+        Node {
+            width: Val::Px(width),
+            flex_direction: FlexDirection::Column,
+            padding: UiRect::new(Val::Px(22.0), Val::Px(20.0), Val::Px(20.0), Val::Px(22.0)),
+            row_gap: Val::Px(16.0),
+            align_items: AlignItems::Center,
+            border: UiRect::all(Val::Px(1.0)),
+            ..default()
+        },
+        BackgroundColor(PANEL),
+        BorderColor(GOLD_DIM),
+    )
+}
+
+pub fn menu_framed_overlay(
+    parent: &mut ChildBuilder,
+    theme: &UiTheme,
+    fill: impl FnOnce(&mut ChildBuilder, &UiTheme),
+) {
+    parent
+        .spawn((
+            Node {
+                padding: UiRect::all(Val::Px(3.0)),
+                border: UiRect::all(Val::Px(2.0)),
+                ..default()
+            },
+            BackgroundColor(PARCHMENT),
+            BorderColor(GOLD),
+        ))
+        .with_children(|frame| fill(frame, theme));
 }
 
 pub fn spawn_ornate_divider(parent: &mut ChildBuilder, theme: &UiTheme) {
@@ -193,17 +265,75 @@ pub fn spawn_star_watermark(parent: &mut ChildBuilder, theme: &UiTheme) {
     ));
 }
 
+#[derive(Component)]
+pub struct MenuButton;
+
 pub fn menu_button_bundle() -> impl Bundle {
+    menu_button_node_bundle(Val::Auto)
+}
+
+pub fn menu_button_row_bundle() -> impl Bundle {
+    menu_button_node_bundle(Val::Percent(100.0))
+}
+
+fn menu_button_node_bundle(width: Val) -> impl Bundle {
     (
         Button,
         Node {
-            padding: UiRect::new(Val::Px(14.0), Val::Px(18.0), Val::Px(10.0), Val::Px(10.0)),
+            width,
+            height: Val::Px(46.0),
+            padding: UiRect::ZERO,
             justify_content: JustifyContent::Center,
             align_items: AlignItems::Center,
             border: UiRect::all(Val::Px(1.0)),
+            overflow: Overflow::clip(),
             ..default()
         },
         BackgroundColor(BTN_IDLE),
         BorderColor(GOLD_DIM),
     )
+}
+
+/// Cinzel sits high in its line box — nudge labels down for even vertical padding.
+const MENU_BUTTON_LABEL_NUDGE: f32 = 3.0;
+
+/// Label inside a menu button — clipped inner row keeps Cinzel's line box off the border edges.
+pub fn spawn_menu_button_label(
+    parent: &mut ChildBuilder,
+    theme: &UiTheme,
+    text: impl Into<String>,
+    extra: impl Bundle,
+) {
+    parent
+        .spawn((
+            Node {
+                width: Val::Percent(100.0),
+                height: Val::Percent(100.0),
+                justify_content: JustifyContent::Center,
+                align_items: AlignItems::Center,
+                overflow: Overflow::clip(),
+                ..default()
+            },
+        ))
+        .with_children(|inner| {
+            inner
+                .spawn((
+                    Node {
+                        margin: UiRect::new(
+                            Val::Px(0.0),
+                            Val::Px(0.0),
+                            Val::Px(MENU_BUTTON_LABEL_NUDGE),
+                            Val::Px(0.0),
+                        ),
+                        ..default()
+                    },
+                ))
+                .with_children(|label| {
+                    label.spawn((
+                        theme.value(text, 17.0),
+                        TextLayout::new_with_no_wrap(),
+                        extra,
+                    ));
+                });
+        });
 }

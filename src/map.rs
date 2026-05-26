@@ -80,6 +80,9 @@ pub enum TerrainType {
     SacredGround,
     Cinderfield,
     Rootfield,
+    Duskwood,
+    Frostpine,
+    Ashgrove,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -840,6 +843,14 @@ fn speckle_cleanup(gen: &mut [TileGen], by_coord: &TileIndex) {
         ) {
             continue;
         }
+        // Center magic forests are patch-unified in center_island; speckle would
+        // erase their ragged edges back to Cinderfield/Rootfield.
+        if matches!(
+            tile.terrain,
+            TerrainType::Duskwood | TerrainType::Frostpine | TerrainType::Ashgrove
+        ) {
+            continue;
+        }
 
         let mut same = 0;
         let mut land_neighbors = 0;
@@ -916,6 +927,9 @@ fn terrain_name(t: TerrainType) -> &'static str {
         TerrainType::SacredGround => "SacredGround",
         TerrainType::Cinderfield => "Cinderfield",
         TerrainType::Rootfield => "Rootfield",
+        TerrainType::Duskwood => "Duskwood",
+        TerrainType::Frostpine => "Frostpine",
+        TerrainType::Ashgrove => "Ashgrove",
     }
 }
 
@@ -945,6 +959,9 @@ fn log_distribution(tiles: &[HexTile]) {
         TerrainType::AridPeak,
         TerrainType::Cinderfield,
         TerrainType::Rootfield,
+        TerrainType::Duskwood,
+        TerrainType::Frostpine,
+        TerrainType::Ashgrove,
     ];
 
     println!("=== Terrain Distribution ===");
@@ -987,7 +1004,17 @@ mod tests {
         TerrainType::Beach,
         TerrainType::Cinderfield,
         TerrainType::Rootfield,
+        TerrainType::Duskwood,
+        TerrainType::Frostpine,
+        TerrainType::Ashgrove,
     ];
+
+    fn is_center_forest(t: TerrainType) -> bool {
+        matches!(
+            t,
+            TerrainType::Duskwood | TerrainType::Frostpine | TerrainType::Ashgrove
+        )
+    }
 
     fn is_outer_forest(t: TerrainType) -> bool {
         matches!(
@@ -1233,13 +1260,28 @@ mod tests {
                 .iter()
                 .filter_map(|c| terrains.get(c).copied())
                 .collect();
-            for t in [TerrainType::Cinderfield, TerrainType::Rootfield] {
+            for t in [
+                TerrainType::Cinderfield,
+                TerrainType::Rootfield,
+                TerrainType::Duskwood,
+                TerrainType::Frostpine,
+                TerrainType::Ashgrove,
+            ] {
                 assert!(
                     center_present.contains(&t),
-                    "seed {seed} center missing base {:?}",
+                    "seed {seed} center missing terrain {:?}",
                     t
                 );
             }
+            let forest_frac = center
+                .iter()
+                .filter(|c| terrains.get(c).is_some_and(|t| is_center_forest(*t)))
+                .count() as f32
+                / center.len().max(1) as f32;
+            assert!(
+                (0.18..=0.28).contains(&forest_frac),
+                "seed {seed} center forest fraction {forest_frac} outside ~20–25 %"
+            );
             assert!(
                 !center_present.contains(&TerrainType::Freshwater),
                 "seed {seed} center must not have lakes"
