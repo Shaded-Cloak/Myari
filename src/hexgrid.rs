@@ -83,18 +83,6 @@ pub fn axial_to_pixel(q: i32, r: i32, size: f32) -> (f32, f32) {
     (pos.x, pos.y)
 }
 
-/// Convert pixel coords to axial (fractional).
-pub fn pixel_to_axial_frac(x: f32, y: f32, size: f32) -> (f32, f32) {
-    let frac = flat_layout(size).world_pos_to_fract_hex(hexx::Vec2::new(x, y));
-    (frac.x, frac.y)
-}
-
-/// Round fractional axial coords to nearest hex.
-pub fn axial_round(q: f32, r: f32) -> HexCoord {
-    let h = Hex::new(q.round() as i32, r.round() as i32);
-    HexCoord::new(h.x, h.y)
-}
-
 /// Convert pixel to hex.
 pub fn pixel_to_hex(x: f32, y: f32, size: f32) -> HexCoord {
     let h = flat_layout(size).world_pos_to_hex(hexx::Vec2::new(x, y));

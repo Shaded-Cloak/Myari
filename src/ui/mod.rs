@@ -7,7 +7,6 @@ use crate::app_state::InGameHud;
 
 pub mod hover_gem;
 pub mod loading_screen;
-pub mod title_constellations;
 pub mod title_hex_grid;
 pub mod title_menu;
 
@@ -343,10 +342,6 @@ pub struct MenuButton;
 
 #[derive(Component)]
 pub struct MenuButtonFill;
-
-pub fn menu_button_bundle() -> impl Bundle {
-    menu_button_node_bundle(Val::Auto)
-}
 
 pub fn menu_button_row_bundle() -> impl Bundle {
     menu_button_node_bundle(Val::Percent(100.0))

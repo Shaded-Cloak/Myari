@@ -236,9 +236,6 @@ fn start_highlight_hop(hop: &mut HighlightHop, from: Vec2, to: Vec2, hex_steps: 
 }
 
 #[derive(Resource)]
-struct GridMesh(Handle<Mesh>);
-
-#[derive(Resource)]
 struct GridMaterial(Handle<ColorMaterial>);
 
 #[derive(Resource, Default)]
@@ -964,7 +961,6 @@ fn spawn_world_visuals(
     ));
 
     let grid_mesh = meshes.add(make_grid_mesh(&map.tiles, HEX_SIZE));
-    commands.insert_resource(GridMesh(grid_mesh.clone()));
     let grid_mat = materials.add(ColorMaterial::from_color(Color::srgb(0.0, 0.0, 0.0)));
     commands.insert_resource(GridMaterial(grid_mat.clone()));
     commands.spawn((
@@ -1030,23 +1026,6 @@ fn spawn_world_entities(
 }
 
 // ── Mesh helpers ────────────────────────────────────────────────
-
-fn make_hex_mesh(size: f32) -> Mesh {
-    let mut positions = vec![[0.0, 0.0, 0.0]];
-    for &(x, y) in &hex_corners_local(size) {
-        positions.push([x, y, 0.0]);
-    }
-    let mut indices = Vec::new();
-    for i in 0..6 {
-        indices.push(0);
-        indices.push(i as u32 + 1);
-        indices.push(((i + 1) % 6) as u32 + 1);
-    }
-    let mut mesh = Mesh::new(PrimitiveTopology::TriangleList, Default::default());
-    mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, positions);
-    mesh.insert_indices(Indices::U32(indices));
-    mesh
-}
 
 fn make_hex_outline_mesh(size: f32) -> Mesh {
     let mut positions: Vec<[f32; 3]> = hex_corners_local(size)
@@ -1872,7 +1851,6 @@ fn handle_quit_to_main_menu_button(
         }
         commands.remove_resource::<GameMap>();
         commands.remove_resource::<GameState>();
-        commands.remove_resource::<GridMesh>();
         commands.remove_resource::<GridMaterial>();
 
         selected.0 = None;
