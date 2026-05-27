@@ -19,8 +19,14 @@ pub enum LoadingJob {
 #[derive(Resource, Default)]
 pub struct LoadingProgress {
     pub step: u8,
+    /// Total time spent in the loading state.
     pub timer: f32,
-    pub bar: f32,
+    /// Time spent in the current pipeline step.
+    pub phase_timer: f32,
+    /// Maximum fill (0–1) unlocked so far; rises gradually per phase.
+    pub bar_cap: f32,
+    /// Value drawn on the loading bar; creeps toward `bar_cap` each frame.
+    pub bar_display: f32,
     pub status: String,
     pub work_done: bool,
     pub ui_done: bool,
@@ -36,7 +42,9 @@ impl LoadingProgress {
         Self {
             step: 0,
             timer: 0.0,
-            bar: 0.1,
+            phase_timer: 0.0,
+            bar_cap: 0.05,
+            bar_display: 0.0,
             status: status.to_string(),
             work_done: false,
             ui_done: false,

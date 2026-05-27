@@ -15,28 +15,43 @@ use bevy::prelude::*;
 use bevy::render::mesh::Indices;
 use bevy::render::render_resource::PrimitiveTopology;
 use bevy::window::{MonitorSelection, PrimaryWindow, WindowMode};
+use bevy::transform::TransformSystem;
 use bevy::ui::UiSystem;
 use bevy_pancam::{PanCam, PanCamPlugin};
 use rand::Rng;
 use std::collections::HashSet;
 
 use game::GameState;
-use crate::hexgrid::{axial_to_pixel, hex_corners_at, hex_corners_local, pixel_to_hex, HexCoord};
+use crate::hexgrid::{axial_to_pixel, hex_corners_at, hex_corners_local, hex_world_bounds, pixel_to_hex, HexCoord};
 use map::{Map, HexTile, TerrainType, MAP_RADIUS};
 use ui::{
+    hover_gem::{spawn_hover_gem_swatch, HoverSwatch},
     loading_screen::{spawn_loading_screen, sync_loading_ui, LoadingRoot},
-    menu_button_row_bundle, menu_panel_intro_transform, menu_panel_outro_transform,
-    menu_framed_overlay, menu_panel_bundle, spawn_framed_panel, spawn_menu_button_label,
+    menu_button_row_bundle, menu_panel_intro_transform,
+    menu_framed_overlay, menu_panel_bundle_with_fade, menu_panel_outro_transform, spawn_framed_panel, spawn_menu_button_label,
     spawn_ornate_divider, spawn_star_watermark, title_menu::{
         self, spawn_title_menu, sync_title_subscreen, TitleRoot, TitleScreen,
     },
-    ease_out_cubic, HudAnchor, MenuButton, UiTheme, BTN_HOVER, BTN_IDLE, BTN_PRESSED,
-    GEM_FRAME, GOLD, MENU_BACKDROP, MENU_ENTER_SECS, MENU_EXIT_SECS, MENU_SWITCH_SECS,
+    apply_menu_fade_alpha, ease_out_cubic, HudAnchor, MenuButton, MenuButtonFill, MenuFadeLayer,
+    UiTheme, BTN_HOVER, BTN_IDLE, BTN_PRESSED,
+    GOLD, MENU_BACKDROP, MENU_ENTER_SECS, MENU_EXIT_SECS, MENU_SWITCH_SECS,
 };
 
 const HEX_SIZE: f32 = 28.0;
-const MIN_LOAD_SECS: f32 = 1.0;
+const MIN_LOAD_SECS: f32 = 1.55;
 const LOAD_INTRO_SECS: f32 = 0.35;
+const LOAD_WORLD_SECS: f32 = 0.55;
+const LOAD_UI_SECS: f32 = 0.45;
+/// One hex step — short ease-out slide between tile centres.
+const HOVER_HOP_NEIGHBOR_SECS: f32 = 0.09;
+/// Two hex steps — quick catch-up.
+const HOVER_HOP_TWO_SECS: f32 = 0.048;
+/// Extra margin so the map isn't flush against the screen edge.
+const MAP_CAMERA_PADDING: f32 = 1.06;
+/// Grid fully visible when hex height on screen is at least this many pixels.
+const GRID_HEX_PX_FADE_START: f32 = 28.0;
+/// Grid hidden when hex height on screen is at or below this (only at extreme zoom-out).
+const GRID_HEX_PX_FADE_END: f32 = 7.0;
 
 fn main() {
     println!("Myari starting up...");
@@ -56,6 +71,7 @@ fn main() {
         .init_resource::<FpsCounter>()
         .init_resource::<GridVisible>()
         .init_resource::<MenuScreen>()
+        .init_resource::<MenuScreenEpoch>()
         .init_resource::<MenuMotion>()
         .init_resource::<Zoom>()
         .init_resource::<CurrentSeed>()
@@ -77,7 +93,11 @@ fn main() {
             )
                 .after(setup_ui_theme),
         )
-        .add_systems(Update, (sync_app_screens, sync_pancam, ui::title_hex_grid::sync_title_hex_grid_visibility))
+        .add_systems(Update, (
+            sync_app_screens,
+            sync_world_visibility,
+            ui::title_hex_grid::sync_title_hex_grid_visibility,
+        ))
         .add_systems(
             Update,
             (
@@ -109,20 +129,33 @@ fn main() {
             sync_zoom_from_camera.run_if(in_state(AppState::InGame)),
         )
         .add_systems(
+            OnEnter(AppState::Loading),
+            reset_pause_menu_for_session,
+        )
+        .add_systems(
+            OnEnter(AppState::InGame),
+            (
+                reset_pause_menu_for_session,
+                frame_camera_to_map,
+                reset_hover_highlight_on_enter,
+            )
+                .chain(),
+        )
+        .add_systems(
             Update,
             (
                 track_hover,
-                highlight_hover,
+                animate_hover_highlight,
                 update_hover_panel,
                 handle_selection,
                 move_selected_unit,
-                on_menu_screen_changed,
-                update_menu_motion,
                 handle_menu_escape,
                 handle_resume_button,
-                style_menu_buttons,
                 handle_open_settings_button,
-                handle_toggle_button,
+                on_menu_screen_changed,
+                handle_quit_to_main_menu_button,
+                style_menu_buttons,
+                (handle_toggle_button, sync_grid_for_zoom).chain(),
                 fps_update,
                 end_turn,
                 reroll_world,
@@ -130,6 +163,22 @@ fn main() {
                 load_game,
             )
                 .run_if(in_state(AppState::InGame)),
+        )
+        .add_systems(
+            PostUpdate,
+            (
+                update_menu_motion,
+                sync_pancam.after(update_menu_motion),
+            )
+                .run_if(in_state(AppState::InGame))
+                // Scale must be set before layout; after layout causes end-of-close stutter.
+                .before(UiSystem::Layout)
+                .before(TransformSystem::TransformPropagate),
+        )
+        .add_systems(
+            PostUpdate,
+            sync_pancam
+                .run_if(not(in_state(AppState::InGame))),
         )
         .run();
 }
@@ -162,6 +211,30 @@ struct FpsText;
 #[derive(Component)]
 struct Highlight;
 
+#[derive(Component, Default)]
+struct HighlightHop {
+    from: Vec2,
+    to: Vec2,
+    elapsed: f32,
+    duration: f32,
+}
+
+fn hover_hop_duration(hex_steps: i32) -> f32 {
+    match hex_steps {
+        0 => 0.0,
+        1 => HOVER_HOP_NEIGHBOR_SECS,
+        2 => HOVER_HOP_TWO_SECS,
+        _ => 0.0,
+    }
+}
+
+fn start_highlight_hop(hop: &mut HighlightHop, from: Vec2, to: Vec2, hex_steps: i32) {
+    hop.from = from;
+    hop.to = to;
+    hop.elapsed = 0.0;
+    hop.duration = hover_hop_duration(hex_steps);
+}
+
 #[derive(Resource)]
 struct GridMesh(Handle<Mesh>);
 
@@ -170,6 +243,9 @@ struct GridMaterial(Handle<ColorMaterial>);
 
 #[derive(Resource, Default)]
 struct GridVisible(bool);
+
+#[derive(Resource, Default)]
+struct MenuScreenEpoch(u32);
 
 #[derive(Resource, Default, PartialEq, Eq, Clone, Copy)]
 enum MenuScreen {
@@ -185,6 +261,8 @@ enum MenuMotionPhase {
     Idle,
     Enter,
     Exit,
+    /// One frame after exit animation — defers pan re-enable.
+    Teardown,
     Switch,
 }
 
@@ -221,6 +299,9 @@ struct OpenSettingsButton;
 #[derive(Component)]
 struct ResumeButton;
 
+#[derive(Component)]
+struct QuitToMainMenuButton;
+
 #[derive(Resource, Default)]
 struct InGameUiReady(bool);
 
@@ -244,9 +325,6 @@ struct WorldEntity;
 
 #[derive(Component)]
 struct HoverPanel;
-
-#[derive(Component)]
-struct HoverSwatch;
 
 #[derive(Component)]
 struct HoverNameText;
@@ -298,8 +376,9 @@ fn sync_pancam(
     mut cameras: Query<&mut PanCam>,
 ) {
     if let Ok(mut pan) = cameras.get_single_mut() {
-        let pause_visible =
-            *screen != MenuScreen::Closed || motion.phase == MenuMotionPhase::Exit;
+        let pause_visible = *screen != MenuScreen::Closed
+            || motion.phase == MenuMotionPhase::Exit
+            || motion.phase == MenuMotionPhase::Teardown;
         pan.enabled = *app_state.get() == AppState::InGame && !pause_visible;
     }
 }
@@ -311,6 +390,105 @@ fn sync_zoom_from_camera(
     if let Ok(proj) = cameras.get_single() {
         zoom.0 = proj.scale;
     }
+}
+
+/// Alpha for the hex grid from camera scale (`projection.scale` ≈ world-units per pixel).
+fn grid_alpha_for_scale(scale: f32) -> f32 {
+    if scale <= 0.0 || !scale.is_finite() {
+        return 0.0;
+    }
+    let hex_px = (2.0 * HEX_SIZE) / scale;
+    if hex_px <= GRID_HEX_PX_FADE_END {
+        return 0.0;
+    }
+    if hex_px >= GRID_HEX_PX_FADE_START {
+        return 1.0;
+    }
+    let t = (hex_px - GRID_HEX_PX_FADE_END) / (GRID_HEX_PX_FADE_START - GRID_HEX_PX_FADE_END);
+    t * t * (3.0 - 2.0 * t)
+}
+
+fn sync_grid_for_zoom(
+    zoom: Res<Zoom>,
+    grid_visible: Res<GridVisible>,
+    grid_material: Option<Res<GridMaterial>>,
+    mut materials: ResMut<Assets<ColorMaterial>>,
+    mut grid_query: Query<&mut Visibility, With<GridMarker>>,
+) {
+    let Some(grid_mat) = grid_material else {
+        return;
+    };
+    let alpha = if grid_visible.0 {
+        grid_alpha_for_scale(zoom.0)
+    } else {
+        0.0
+    };
+    if let Some(mat) = materials.get_mut(&grid_mat.0) {
+        mat.color = Color::srgba(0.0, 0.0, 0.0, alpha);
+    }
+    if let Ok(mut vis) = grid_query.get_single_mut() {
+        *vis = if alpha > 0.001 {
+            Visibility::Visible
+        } else {
+            Visibility::Hidden
+        };
+    }
+}
+
+fn reset_hover_highlight_on_enter(mut highlight: Query<&mut Visibility, With<Highlight>>) {
+    if let Ok(mut visibility) = highlight.get_single_mut() {
+        *visibility = Visibility::Hidden;
+    }
+}
+
+fn frame_camera_to_map(
+    game_map: Res<GameMap>,
+    window: Query<&Window, With<PrimaryWindow>>,
+    mut cameras: Query<(&mut Transform, &mut OrthographicProjection), With<Camera2d>>,
+    mut zoom: ResMut<Zoom>,
+) {
+    let Ok(window) = window.get_single() else {
+        return;
+    };
+    let window_size = Vec2::new(window.width(), window.height());
+    if window_size.x <= 0.0 || window_size.y <= 0.0 {
+        return;
+    }
+    let Ok((mut transform, mut projection)) = cameras.get_single_mut() else {
+        return;
+    };
+    apply_camera_frame_to_tiles(
+        &game_map.0.tiles,
+        window_size,
+        &mut transform,
+        &mut projection,
+        &mut zoom.0,
+    );
+}
+
+fn apply_camera_frame_to_tiles(
+    tiles: &[HexTile],
+    window_size: Vec2,
+    transform: &mut Transform,
+    projection: &mut OrthographicProjection,
+    zoom: &mut f32,
+) {
+    let coords = tiles.iter().map(|t| t.coord);
+    let (min_x, min_y, max_x, max_y) = hex_world_bounds(coords, HEX_SIZE);
+    if !min_x.is_finite() {
+        return;
+    }
+
+    transform.translation.x = (min_x + max_x) * 0.5;
+    transform.translation.y = (min_y + max_y) * 0.5;
+
+    let map_w = max_x - min_x;
+    let map_h = max_y - min_y;
+    let scale = (map_w / window_size.x)
+        .max(map_h / window_size.y)
+        * MAP_CAMERA_PADDING;
+    projection.scale = scale.clamp(0.02, 60.0);
+    *zoom = projection.scale;
 }
 
 fn init_save_path(mut save_path: ResMut<SavePath>) {
@@ -331,29 +509,33 @@ fn sync_app_screens(
     mut pause: Query<&mut Node, (With<MenuRoot>, Without<TitleRoot>, Without<LoadingRoot>)>,
     mut hud: Query<&mut Visibility, With<InGameHud>>,
 ) {
-    if !app_state.is_changed() {
-        return;
-    }
     let state = app_state.get();
-    if let Ok(mut node) = title.get_single_mut() {
-        node.display = if *state == AppState::MainMenu {
-            Display::Flex
-        } else {
-            Display::None
-        };
-    }
-    if let Ok(mut node) = loading.get_single_mut() {
-        node.display = if *state == AppState::Loading {
-            Display::Flex
-        } else {
-            Display::None
-        };
-    }
-    if let Ok(mut node) = pause.get_single_mut() {
-        if *state != AppState::InGame {
-            node.display = Display::None;
+    if app_state.is_changed() {
+        if let Ok(mut node) = title.get_single_mut() {
+            node.display = if *state == AppState::MainMenu {
+                Display::Flex
+            } else {
+                Display::None
+            };
+        }
+        if let Ok(mut node) = loading.get_single_mut() {
+            node.display = if *state == AppState::Loading {
+                Display::Flex
+            } else {
+                Display::None
+            };
+        }
+        if let Ok(mut node) = pause.get_single_mut() {
+            if *state == AppState::InGame {
+                // Keep in the layout tree while in-game; open/close uses Visibility to avoid reflow hitches.
+                node.display = Display::Flex;
+            } else {
+                node.display = Display::None;
+            }
         }
     }
+
+    // Every frame — HUD may be spawned mid-load before the next state transition.
     let hud_vis = if *state == AppState::InGame {
         Visibility::Visible
     } else {
@@ -361,6 +543,20 @@ fn sync_app_screens(
     };
     for mut vis in &mut hud {
         *vis = hud_vis;
+    }
+}
+
+fn sync_world_visibility(
+    app_state: Res<State<AppState>>,
+    mut map_meshes: Query<&mut Visibility, (With<WorldEntity>, Without<GridMarker>)>,
+) {
+    let show = *app_state.get() == AppState::InGame;
+    for mut vis in &mut map_meshes {
+        *vis = if show {
+            Visibility::Visible
+        } else {
+            Visibility::Hidden
+        };
     }
 }
 
@@ -372,104 +568,150 @@ fn loading_pipeline(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<ColorMaterial>>,
+    mut images: ResMut<Assets<Image>>,
     mut seed_res: ResMut<CurrentSeed>,
     theme: Res<UiTheme>,
     mut ui_ready: ResMut<InGameUiReady>,
     game_state: Option<Res<GameState>>,
+    window: Query<&Window, With<PrimaryWindow>>,
+    mut cameras: Query<(&mut Transform, &mut OrthographicProjection), With<Camera2d>>,
+    mut zoom: ResMut<Zoom>,
     mut text_queries: ParamSet<(
         Query<&mut Text, With<TurnText>>,
         Query<&mut Text, With<SeedText>>,
     )>,
 ) {
     progress.timer += time.delta_secs();
+    progress.phase_timer += time.delta_secs();
 
     match progress.step {
         0 => {
-            progress.status = "Preparing…".to_string();
-            progress.bar = 0.1;
-            if progress.timer >= LOAD_INTRO_SECS {
+            let t = load_phase_t(progress.phase_timer, LOAD_INTRO_SECS);
+            progress.bar_cap = 0.05 + t * 0.20;
+            if progress.phase_timer >= LOAD_INTRO_SECS {
                 progress.step = 1;
+                progress.phase_timer = 0.0;
             }
         }
-        1 if !progress.work_done => {
-            progress.status = match *job {
-                LoadingJob::NewGame => "Generating world…".to_string(),
-                LoadingJob::Continue => "Loading save…".to_string(),
-                LoadingJob::None => "Working…".to_string(),
-            };
-            progress.bar = 0.55;
-
-            let (map, gs, seed) = match *job {
-                LoadingJob::NewGame => {
-                    let seed = rand::thread_rng().gen::<u64>();
-                    let map = Map::generate(MAP_RADIUS, seed);
-                    let gs = GameState::new(&map);
-                    (map, gs, seed)
+        1 => {
+            if !progress.work_done {
+                if *job == LoadingJob::None {
+                    return;
                 }
-                LoadingJob::Continue => match load_saved_game() {
-                    Ok(data) => {
-                        let map = Map::from_tiles(data.tiles);
-                        (map, data.game_state, data.seed)
+
+                let (map, gs, seed) = match *job {
+                    LoadingJob::NewGame => {
+                        let seed = rand::thread_rng().gen::<u64>();
+                        let map = Map::generate(MAP_RADIUS, seed);
+                        let gs = GameState::new(&map);
+                        (map, gs, seed)
                     }
-                    Err(_) => {
-                        progress.status = "Failed to load save".to_string();
-                        progress.step = 3;
-                        progress.bar = 1.0;
-                        return;
+                    LoadingJob::Continue => match load_saved_game() {
+                        Ok(data) => {
+                            let map = Map::from_tiles(data.tiles);
+                            (map, data.game_state, data.seed)
+                        }
+                        Err(_) => {
+                            progress.status = "Failed to load save".to_string();
+                            progress.step = 3;
+                            progress.phase_timer = 0.0;
+                            progress.bar_cap = 1.0;
+                            return;
+                        }
+                    },
+                    LoadingJob::None => return,
+                };
+
+                seed_res.0 = seed;
+                spawn_world_visuals(&mut commands, &mut meshes, &mut materials, &map, &gs);
+                if let Ok(window) = window.get_single() {
+                    let window_size = Vec2::new(window.width(), window.height());
+                    if window_size.x > 0.0 && window_size.y > 0.0 {
+                        if let Ok((mut transform, mut projection)) = cameras.get_single_mut() {
+                            apply_camera_frame_to_tiles(
+                                &map.tiles,
+                                window_size,
+                                &mut transform,
+                                &mut projection,
+                                &mut zoom.0,
+                            );
+                        }
                     }
-                },
-                LoadingJob::None => return,
-            };
-
-            seed_res.0 = seed;
-            spawn_world_visuals(&mut commands, &mut meshes, &mut materials, &map, &gs);
-            commands.insert_resource(GameMap(map));
-            commands.insert_resource(gs);
-
-            progress.work_done = true;
-            progress.step = 2;
-            progress.bar = 0.85;
-        }
-        2 if !progress.ui_done => {
-            progress.status = "Placing civilizations…".to_string();
-            progress.bar = 0.9;
-
-            if !ui_ready.0 {
-                fps_startup(&mut commands, &theme);
-                spawn_game_hud(&mut commands, &theme, seed_res.0);
-                spawn_hover_panel(&mut commands, &theme);
-                let hm = meshes.add(make_hex_outline_mesh(HEX_SIZE));
-                commands.spawn((
-                    Mesh2d(hm),
-                    MeshMaterial2d(materials.add(ColorMaterial::from_color(Color::srgba(
-                        0.05, 0.95, 1.0, 1.0,
-                    )))),
-                    Transform::from_xyz(0.0, 0.0, 5.0),
-                    Visibility::Hidden,
-                    Highlight,
-                    InGameHud,
-                ));
-                ui_ready.0 = true;
-            }
-
-            if let Some(gs) = game_state.as_ref() {
-                if let Ok(mut text) = text_queries.p0().get_single_mut() {
-                    text.0 = gs.turn.to_string();
                 }
-            }
-            if let Ok(mut text) = text_queries.p1().get_single_mut() {
-                text.0 = seed_res.0.to_string();
+                commands.insert_resource(GameMap(map));
+                commands.insert_resource(gs);
+                progress.work_done = true;
             }
 
-            progress.ui_done = true;
-            progress.step = 3;
-            progress.status = "Ready".to_string();
-            progress.bar = 1.0;
+            let t = load_phase_t(progress.phase_timer, LOAD_WORLD_SECS);
+            progress.bar_cap = 0.25 + t * 0.45;
+            if progress.work_done && progress.phase_timer >= LOAD_WORLD_SECS {
+                progress.step = 2;
+                progress.phase_timer = 0.0;
+            }
         }
-        3 if progress.timer >= MIN_LOAD_SECS => {
-            next_state.set(AppState::InGame);
+        2 => {
+            if !progress.ui_done {
+                if !ui_ready.0 {
+                    fps_startup(&mut commands, &theme);
+                    spawn_game_hud(&mut commands, &theme, seed_res.0);
+                    spawn_hover_panel(&mut commands, &theme, &mut images);
+                    let hm = meshes.add(make_hex_outline_mesh(HEX_SIZE));
+                    commands.spawn((
+                        Mesh2d(hm),
+                        MeshMaterial2d(materials.add(ColorMaterial::from_color(GOLD))),
+                        Transform::from_xyz(0.0, 0.0, 5.0),
+                        Visibility::Hidden,
+                        Highlight,
+                        HighlightHop::default(),
+                        InGameHud,
+                    ));
+                    ui_ready.0 = true;
+                }
+
+                if let Some(gs) = game_state.as_ref() {
+                    if let Ok(mut text) = text_queries.p0().get_single_mut() {
+                        text.0 = gs.turn.to_string();
+                    }
+                }
+                if let Ok(mut text) = text_queries.p1().get_single_mut() {
+                    text.0 = seed_res.0.to_string();
+                }
+
+                progress.ui_done = true;
+            }
+
+            let t = load_phase_t(progress.phase_timer, LOAD_UI_SECS);
+            progress.bar_cap = 0.70 + t * 0.25;
+            if progress.ui_done && progress.phase_timer >= LOAD_UI_SECS {
+                progress.step = 3;
+                progress.phase_timer = 0.0;
+            }
+        }
+        3 => {
+            let tail = (MIN_LOAD_SECS
+                - LOAD_INTRO_SECS
+                - LOAD_WORLD_SECS
+                - LOAD_UI_SECS)
+                .max(0.2);
+            let t = load_phase_t(progress.phase_timer, tail);
+            progress.bar_cap = 0.95 + t * 0.05;
+            if progress.timer >= MIN_LOAD_SECS {
+                next_state.set(AppState::InGame);
+            }
         }
         _ => {}
+    }
+    if progress.status != "Failed to load save" {
+        progress.status = "Preparing…".to_string();
+    }
+}
+
+fn load_phase_t(elapsed: f32, duration: f32) -> f32 {
+    if duration <= 0.0 {
+        1.0
+    } else {
+        (elapsed / duration).clamp(0.0, 1.0)
     }
 }
 
@@ -501,7 +743,7 @@ fn spawn_game_hud(commands: &mut Commands, theme: &UiTheme, seed: u64) {
     );
 }
 
-fn spawn_hover_panel(commands: &mut Commands, theme: &UiTheme) {
+fn spawn_hover_panel(commands: &mut Commands, theme: &UiTheme, images: &mut Assets<Image>) {
     spawn_framed_panel(
         commands,
         theme,
@@ -526,31 +768,7 @@ fn spawn_hover_panel(commands: &mut Commands, theme: &UiTheme) {
                     },
                 ))
                 .with_children(|row| {
-                    row.spawn((
-                        Node {
-                            width: Val::Px(34.0),
-                            height: Val::Px(34.0),
-                            justify_content: JustifyContent::Center,
-                            align_items: AlignItems::Center,
-                            border: UiRect::all(Val::Px(1.0)),
-                            ..default()
-                        },
-                        BackgroundColor(GEM_FRAME),
-                        BorderColor(GOLD),
-                    ))
-                    .with_children(|gem_frame| {
-                        gem_frame.spawn((
-                            Node {
-                                width: Val::Px(15.0),
-                                height: Val::Px(15.0),
-                                border: UiRect::all(Val::Px(1.0)),
-                                ..default()
-                            },
-                            BackgroundColor(Color::srgb(0.35, 0.38, 0.45)),
-                            BorderColor(Color::srgba(1.0, 0.95, 0.75, 0.45)),
-                            HoverSwatch,
-                        ));
-                    });
+                    spawn_hover_gem_swatch(row, images);
                     row.spawn((theme.value("—", 26.0), HoverNameText));
                 });
 
@@ -678,6 +896,9 @@ fn load_game(
     mut gs: ResMut<GameState>,
     mut game_map: ResMut<GameMap>,
     mut seed_res: ResMut<CurrentSeed>,
+    mut zoom: ResMut<Zoom>,
+    window: Query<&Window, With<PrimaryWindow>>,
+    mut cameras: Query<(&mut Transform, &mut OrthographicProjection), With<Camera2d>>,
     mut text_queries: ParamSet<(
         Query<&mut Text, With<TurnText>>,
         Query<&mut Text, With<SeedText>>,
@@ -702,6 +923,21 @@ fn load_game(
     spawn_world_visuals(&mut commands, &mut meshes, &mut materials, &map, &gs);
     game_map.0 = map;
 
+    if let Ok(window) = window.get_single() {
+        let window_size = Vec2::new(window.width(), window.height());
+        if window_size.x > 0.0 && window_size.y > 0.0 {
+            if let Ok((mut transform, mut projection)) = cameras.get_single_mut() {
+                apply_camera_frame_to_tiles(
+                    &game_map.0.tiles,
+                    window_size,
+                    &mut transform,
+                    &mut projection,
+                    &mut zoom.0,
+                );
+            }
+        }
+    }
+
     if let Ok(mut text) = text_queries.p0().get_single_mut() {
         text.0 = gs.turn.to_string();
     }
@@ -723,6 +959,7 @@ fn spawn_world_visuals(
         Mesh2d(map_mesh),
         MeshMaterial2d(materials.add(ColorMaterial::default())),
         Transform::default(),
+        Visibility::Hidden,
         WorldEntity,
     ));
 
@@ -958,23 +1195,62 @@ fn track_hover(
     hovered.0 = Some(pixel_to_hex(world.x, world.y, HEX_SIZE));
 }
 
-fn highlight_hover(
+fn animate_hover_highlight(
+    time: Res<Time>,
     hovered: Res<HoveredHex>,
-    mut query: Query<(&mut Transform, &mut Visibility), With<Highlight>>,
-    mut prev: Local<Option<HexCoord>>,
+    mut query: Query<(&mut Transform, &mut Visibility, &mut HighlightHop), With<Highlight>>,
+    mut prev_hex: Local<Option<HexCoord>>,
 ) {
-    if hovered.0 == *prev { return; }
-    *prev = hovered.0;
-    let Ok((mut transform, mut visibility)) = query.get_single_mut() else {
+    let Ok((mut transform, mut visibility, mut hop)) = query.get_single_mut() else {
         return;
     };
-    if let Some(hex) = hovered.0 {
-        let (wx, wy) = axial_to_pixel(hex.q, hex.r, HEX_SIZE);
-        transform.translation = Vec3::new(wx, wy, 5.0);
-        *visibility = Visibility::Visible;
-    } else {
+
+    let Some(hex) = hovered.0 else {
         *visibility = Visibility::Hidden;
+        *prev_hex = None;
+        hop.duration = 0.0;
+        return;
+    };
+
+    let (tx, ty) = axial_to_pixel(hex.q, hex.r, HEX_SIZE);
+    let target = Vec2::new(tx, ty);
+
+    if *visibility == Visibility::Hidden {
+        transform.translation = Vec3::new(target.x, target.y, 5.0);
+        *visibility = Visibility::Visible;
+        *prev_hex = Some(hex);
+        hop.duration = 0.0;
+        return;
     }
+
+    let hex_changed = prev_hex.map(|h| h != hex).unwrap_or(true);
+    if hex_changed {
+        let steps = prev_hex.map(|h| h.distance(&hex)).unwrap_or(0);
+        let from = transform.translation.truncate();
+        start_highlight_hop(&mut hop, from, target, steps);
+        *prev_hex = Some(hex);
+
+        if hop.duration <= 0.0 {
+            transform.translation = Vec3::new(target.x, target.y, 5.0);
+            *visibility = Visibility::Visible;
+            return;
+        }
+    } else if hop.duration <= 0.0 {
+        transform.translation = Vec3::new(target.x, target.y, 5.0);
+        *visibility = Visibility::Visible;
+        return;
+    }
+
+    hop.elapsed += time.delta_secs();
+    if hop.elapsed >= hop.duration {
+        transform.translation = Vec3::new(hop.to.x, hop.to.y, 5.0);
+        hop.duration = 0.0;
+    } else {
+        let t = ease_out_cubic(hop.elapsed / hop.duration);
+        let pos = hop.from.lerp(hop.to, t);
+        transform.translation = Vec3::new(pos.x, pos.y, 5.0);
+    }
+    *visibility = Visibility::Visible;
 }
 
 // ── Tile selection (right-click) ────────────────────────────────
@@ -1075,6 +1351,71 @@ fn fps_update(
 
 // ── Pause menu (Esc, in-game only) ──────────────────────────────
 
+fn reset_pause_menu_for_session(
+    mut epoch: ResMut<MenuScreenEpoch>,
+    mut screen: ResMut<MenuScreen>,
+    mut motion: ResMut<MenuMotion>,
+    mut menu_root: Query<
+        (&mut Node, &mut Visibility),
+        (
+            With<MenuRoot>,
+            Without<PauseHomePanel>,
+            Without<SettingsMenuPanel>,
+        ),
+    >,
+    mut main: Query<
+        &mut Node,
+        (
+            With<PauseHomePanel>,
+            Without<MenuRoot>,
+            Without<SettingsMenuPanel>,
+        ),
+    >,
+    mut settings: Query<
+        &mut Node,
+        (
+            With<SettingsMenuPanel>,
+            Without<MenuRoot>,
+            Without<PauseHomePanel>,
+        ),
+    >,
+    mut main_xform: Query<&mut Transform, (With<PauseHomePanel>, Without<SettingsMenuPanel>)>,
+    mut settings_xform: Query<&mut Transform, (With<SettingsMenuPanel>, Without<PauseHomePanel>)>,
+    mut overlay_xform: Query<
+        &mut Transform,
+        (
+            With<MenuRoot>,
+            Without<PauseHomePanel>,
+            Without<SettingsMenuPanel>,
+        ),
+    >,
+    mut fade_layers: Query<(&MenuFadeLayer, &mut BackgroundColor)>,
+) {
+    epoch.0 += 1;
+    *screen = MenuScreen::Closed;
+    *motion = MenuMotion::default();
+    if let Ok((mut node, mut vis)) = menu_root.get_single_mut() {
+        node.display = Display::None;
+        *vis = Visibility::Hidden;
+    }
+    if let Ok(mut node) = main.get_single_mut() {
+        node.display = Display::None;
+    }
+    if let Ok(mut node) = settings.get_single_mut() {
+        node.display = Display::None;
+    }
+    if let Ok(mut xform) = main_xform.get_single_mut() {
+        *xform = Transform::default();
+    }
+    if let Ok(mut xform) = settings_xform.get_single_mut() {
+        *xform = Transform::default();
+    }
+    if let Ok(mut xform) = overlay_xform.get_single_mut() {
+        *xform = Transform::default();
+    }
+    apply_menu_fade_alpha(0.0, &mut fade_layers);
+}
+
 fn spawn_pause_menu(mut commands: Commands, theme: Res<UiTheme>) {
     commands
         .spawn((
@@ -1090,6 +1431,10 @@ fn spawn_pause_menu(mut commands: Commands, theme: Res<UiTheme>) {
                 ..default()
             },
             BackgroundColor(MENU_BACKDROP),
+            MenuFadeLayer {
+                base: MENU_BACKDROP,
+            },
+            Visibility::Hidden,
             MenuRoot,
         ))
         .with_children(|overlay| {
@@ -1102,8 +1447,10 @@ fn spawn_pause_menu(mut commands: Commands, theme: Res<UiTheme>) {
                     PauseHomePanel,
                 ))
                 .with_children(|main| {
-                    menu_framed_overlay(main, &theme, |frame, theme| {
-                        frame.spawn(menu_panel_bundle(320.0)).with_children(|panel| {
+                    menu_framed_overlay(main, &theme, true, |frame, theme| {
+                        frame
+                            .spawn(menu_panel_bundle_with_fade(320.0))
+                            .with_children(|panel| {
                             panel.spawn(theme.value("PAUSED", 26.0));
                             spawn_ornate_divider(panel, theme);
                             panel
@@ -1124,6 +1471,15 @@ fn spawn_pause_menu(mut commands: Commands, theme: Res<UiTheme>) {
                                 .with_children(|btn| {
                                     spawn_menu_button_label(btn, theme, "Settings", ());
                                 });
+                            panel
+                                .spawn((
+                                    menu_button_row_bundle(),
+                                    MenuButton,
+                                    QuitToMainMenuButton,
+                                ))
+                                .with_children(|btn| {
+                                    spawn_menu_button_label(btn, theme, "Main Menu", ());
+                                });
                             panel.spawn(theme.hint("ESC — Close menu", 12.0));
                         });
                     });
@@ -1138,8 +1494,10 @@ fn spawn_pause_menu(mut commands: Commands, theme: Res<UiTheme>) {
                     SettingsMenuPanel,
                 ))
                 .with_children(|settings| {
-                    menu_framed_overlay(settings, &theme, |frame, theme| {
-                        frame.spawn(menu_panel_bundle(320.0)).with_children(|panel| {
+                    menu_framed_overlay(settings, &theme, true, |frame, theme| {
+                        frame
+                            .spawn(menu_panel_bundle_with_fade(320.0))
+                            .with_children(|panel| {
                             panel.spawn(theme.value("SETTINGS", 26.0));
                             spawn_ornate_divider(panel, theme);
                             panel
@@ -1160,9 +1518,14 @@ fn spawn_pause_menu(mut commands: Commands, theme: Res<UiTheme>) {
 
 fn on_menu_screen_changed(
     screen: Res<MenuScreen>,
+    epoch: Res<MenuScreenEpoch>,
     mut motion: ResMut<MenuMotion>,
+    mut last_epoch: Local<u32>,
     mut last: Local<MenuScreen>,
-    mut overlay: Query<&mut Node, (With<MenuRoot>, Without<PauseHomePanel>, Without<SettingsMenuPanel>)>,
+    mut overlay: Query<
+        (&mut Node, &mut Visibility),
+        (With<MenuRoot>, Without<PauseHomePanel>, Without<SettingsMenuPanel>),
+    >,
     mut main: Query<&mut Node, (With<PauseHomePanel>, Without<MenuRoot>, Without<SettingsMenuPanel>)>,
     mut settings: Query<
         &mut Node,
@@ -1176,11 +1539,21 @@ fn on_menu_screen_changed(
         &mut Transform,
         (With<SettingsMenuPanel>, Without<MenuRoot>, Without<PauseHomePanel>),
     >,
-    mut overlay_bg: Query<
-        &mut BackgroundColor,
-        (With<MenuRoot>, Without<PauseHomePanel>, Without<SettingsMenuPanel>),
+    mut overlay_xform: Query<
+        &mut Transform,
+        (
+            With<MenuRoot>,
+            Without<PauseHomePanel>,
+            Without<SettingsMenuPanel>,
+        ),
     >,
+    mut fade_layers: Query<(&MenuFadeLayer, &mut BackgroundColor)>,
 ) {
+    if *last_epoch != epoch.0 {
+        *last_epoch = epoch.0;
+        *last = *screen;
+        return;
+    }
     if *last == *screen {
         return;
     }
@@ -1209,13 +1582,13 @@ fn on_menu_screen_changed(
         }
     }
 
-    let show_overlay = *screen != MenuScreen::Closed || motion.phase == MenuMotionPhase::Exit;
-    if let Ok(mut node) = overlay.get_single_mut() {
-        node.display = if show_overlay {
-            Display::Flex
-        } else {
-            Display::None
-        };
+    let show_overlay = *screen != MenuScreen::Closed
+        || motion.phase == MenuMotionPhase::Exit;
+    if let Ok((mut node, mut vis)) = overlay.get_single_mut() {
+        if show_overlay {
+            node.display = Display::Flex;
+            *vis = Visibility::Visible;
+        }
     }
 
     let show_main = *screen == MenuScreen::Main
@@ -1239,11 +1612,15 @@ fn on_menu_screen_changed(
     }
 
     if motion.phase == MenuMotionPhase::Enter {
-        if let Ok(mut bg) = overlay_bg.get_single_mut() {
-            bg.0 = Color::srgba(0.02, 0.02, 0.03, 0.0);
+        apply_menu_fade_alpha(0.0, &mut fade_layers);
+        if let Ok(mut xform) = overlay_xform.get_single_mut() {
+            *xform = menu_panel_intro_transform(0.0);
         }
         if let Ok(mut xform) = main_xform.get_single_mut() {
-            *xform = menu_panel_intro_transform(0.0);
+            *xform = Transform::default();
+        }
+        if let Ok(mut xform) = settings_xform.get_single_mut() {
+            *xform = Transform::default();
         }
     } else if motion.phase == MenuMotionPhase::Switch {
         let xform = if motion.intro_panel == MenuScreen::Main {
@@ -1254,21 +1631,34 @@ fn on_menu_screen_changed(
         if let Ok(mut xform) = xform {
             *xform = menu_panel_intro_transform(0.0);
         }
+        if let Ok(mut xform) = overlay_xform.get_single_mut() {
+            *xform = Transform::default();
+        }
+    } else if motion.phase == MenuMotionPhase::Exit {
+        apply_menu_fade_alpha(1.0, &mut fade_layers);
+        if let Ok(mut xform) = overlay_xform.get_single_mut() {
+            *xform = menu_panel_outro_transform(0.0);
+        }
+        if let Ok(mut xform) = main_xform.get_single_mut() {
+            *xform = Transform::default();
+        }
+        if let Ok(mut xform) = settings_xform.get_single_mut() {
+            *xform = Transform::default();
+        }
     }
 }
 
 fn update_menu_motion(
     time: Res<Time>,
     mut motion: ResMut<MenuMotion>,
-    mut overlay: Query<&mut Node, (With<MenuRoot>, Without<PauseHomePanel>, Without<SettingsMenuPanel>)>,
+    mut overlay: Query<
+        (&mut Node, &mut Visibility),
+        (With<MenuRoot>, Without<PauseHomePanel>, Without<SettingsMenuPanel>),
+    >,
     mut main: Query<&mut Node, (With<PauseHomePanel>, Without<MenuRoot>, Without<SettingsMenuPanel>)>,
     mut settings: Query<
         &mut Node,
         (With<SettingsMenuPanel>, Without<MenuRoot>, Without<PauseHomePanel>),
-    >,
-    mut overlay_bg: Query<
-        &mut BackgroundColor,
-        (With<MenuRoot>, Without<PauseHomePanel>, Without<SettingsMenuPanel>),
     >,
     mut main_xform: Query<
         &mut Transform,
@@ -1278,8 +1668,23 @@ fn update_menu_motion(
         &mut Transform,
         (With<SettingsMenuPanel>, Without<MenuRoot>, Without<PauseHomePanel>),
     >,
+    mut overlay_xform: Query<
+        &mut Transform,
+        (
+            With<MenuRoot>,
+            Without<PauseHomePanel>,
+            Without<SettingsMenuPanel>,
+        ),
+    >,
+    mut fade_layers: Query<(&MenuFadeLayer, &mut BackgroundColor)>,
 ) {
     if motion.phase == MenuMotionPhase::Idle {
+        return;
+    }
+
+    if motion.phase == MenuMotionPhase::Teardown {
+        motion.phase = MenuMotionPhase::Idle;
+        motion.timer = 0.0;
         return;
     }
 
@@ -1288,12 +1693,16 @@ fn update_menu_motion(
 
     match motion.phase {
         MenuMotionPhase::Enter => {
-            let t = ease_out_cubic(raw_t);
-            if let Ok(mut bg) = overlay_bg.get_single_mut() {
-                bg.0 = Color::srgba(0.02, 0.02, 0.03, MENU_BACKDROP.alpha() * t);
+            let fade = ease_out_cubic(raw_t);
+            apply_menu_fade_alpha(fade, &mut fade_layers);
+            if let Ok(mut xform) = overlay_xform.get_single_mut() {
+                *xform = menu_panel_intro_transform(raw_t);
             }
             if let Ok(mut xform) = main_xform.get_single_mut() {
-                *xform = menu_panel_intro_transform(raw_t);
+                *xform = Transform::default();
+            }
+            if let Ok(mut xform) = settings_xform.get_single_mut() {
+                *xform = Transform::default();
             }
         }
         MenuMotionPhase::Switch => {
@@ -1305,22 +1714,24 @@ fn update_menu_motion(
             if let Ok(mut xform) = xform {
                 *xform = menu_panel_intro_transform(raw_t);
             }
+            if let Ok(mut xform) = overlay_xform.get_single_mut() {
+                *xform = Transform::default();
+            }
         }
         MenuMotionPhase::Exit => {
-            let t = ease_out_cubic(raw_t);
-            if let Ok(mut bg) = overlay_bg.get_single_mut() {
-                bg.0 = Color::srgba(0.02, 0.02, 0.03, MENU_BACKDROP.alpha() * (1.0 - t));
-            }
-            let xform = if motion.exit_panel == MenuScreen::Main {
-                main_xform.get_single_mut()
-            } else {
-                settings_xform.get_single_mut()
-            };
-            if let Ok(mut xform) = xform {
+            let fade = ease_out_cubic(1.0 - raw_t);
+            apply_menu_fade_alpha(fade, &mut fade_layers);
+            if let Ok(mut xform) = overlay_xform.get_single_mut() {
                 *xform = menu_panel_outro_transform(raw_t);
             }
+            if let Ok(mut xform) = main_xform.get_single_mut() {
+                *xform = Transform::default();
+            }
+            if let Ok(mut xform) = settings_xform.get_single_mut() {
+                *xform = Transform::default();
+            }
         }
-        MenuMotionPhase::Idle => {}
+        MenuMotionPhase::Teardown | MenuMotionPhase::Idle => {}
     }
 
     if motion.timer < motion.duration {
@@ -1329,22 +1740,31 @@ fn update_menu_motion(
 
     match motion.phase {
         MenuMotionPhase::Enter | MenuMotionPhase::Switch => {
+            if let Ok(mut xform) = overlay_xform.get_single_mut() {
+                *xform = Transform::default();
+            }
             if let Ok(mut xform) = main_xform.get_single_mut() {
                 *xform = Transform::default();
             }
             if let Ok(mut xform) = settings_xform.get_single_mut() {
                 *xform = Transform::default();
             }
-            if let Ok(mut bg) = overlay_bg.get_single_mut() {
-                bg.0 = MENU_BACKDROP;
-            }
+            apply_menu_fade_alpha(1.0, &mut fade_layers);
         }
         MenuMotionPhase::Exit => {
-            if let Ok(mut bg) = overlay_bg.get_single_mut() {
-                bg.0 = Color::srgba(0.02, 0.02, 0.03, 0.0);
+            apply_menu_fade_alpha(0.0, &mut fade_layers);
+            if let Ok((mut node, mut vis)) = overlay.get_single_mut() {
+                node.display = Display::Flex;
+                *vis = Visibility::Hidden;
             }
-            if let Ok(mut node) = overlay.get_single_mut() {
-                node.display = Display::None;
+            if let Ok(mut xform) = overlay_xform.get_single_mut() {
+                *xform = Transform::default();
+            }
+            if let Ok(mut xform) = main_xform.get_single_mut() {
+                *xform = Transform::default();
+            }
+            if let Ok(mut xform) = settings_xform.get_single_mut() {
+                *xform = Transform::default();
             }
             if let Ok(mut node) = main.get_single_mut() {
                 node.display = Display::None;
@@ -1352,12 +1772,14 @@ fn update_menu_motion(
             if let Ok(mut node) = settings.get_single_mut() {
                 node.display = Display::None;
             }
-            // Leave panel transforms at their outro pose — resetting here caused a
-            // one-frame snap while the overlay was still visible.
+            motion.phase = MenuMotionPhase::Teardown;
+            motion.timer = 0.0;
         }
-        MenuMotionPhase::Idle => {}
+        MenuMotionPhase::Idle | MenuMotionPhase::Teardown => {}
     }
-
+    if motion.phase == MenuMotionPhase::Teardown {
+        return;
+    }
     motion.phase = MenuMotionPhase::Idle;
     motion.timer = 0.0;
 }
@@ -1397,14 +1819,20 @@ fn handle_menu_escape(
 }
 
 fn style_menu_buttons(
-    mut query: Query<(&Interaction, &mut BackgroundColor), (Changed<Interaction>, With<MenuButton>)>,
+    mut buttons: Query<(&Interaction, &Children), (Changed<Interaction>, With<MenuButton>)>,
+    mut fills: Query<&mut BackgroundColor, With<MenuButtonFill>>,
 ) {
-    for (interaction, mut bg) in &mut query {
-        bg.0 = match *interaction {
+    for (interaction, children) in &mut buttons {
+        let color = match *interaction {
             Interaction::Pressed => BTN_PRESSED,
             Interaction::Hovered => BTN_HOVER,
             Interaction::None => BTN_IDLE,
         };
+        for child in children.iter() {
+            if let Ok(mut bg) = fills.get_mut(*child) {
+                bg.0 = color;
+            }
+        }
     }
 }
 
@@ -1416,6 +1844,52 @@ fn handle_resume_button(
         if *interaction == Interaction::Pressed {
             *screen = MenuScreen::Closed;
         }
+    }
+}
+
+fn handle_quit_to_main_menu_button(
+    mut interaction: Query<&Interaction, (Changed<Interaction>, With<QuitToMainMenuButton>)>,
+    mut commands: Commands,
+    mut next_state: ResMut<NextState<AppState>>,
+    mut epoch: ResMut<MenuScreenEpoch>,
+    mut screen: ResMut<MenuScreen>,
+    mut motion: ResMut<MenuMotion>,
+    mut title: ResMut<TitleScreen>,
+    mut selected: ResMut<SelectedHex>,
+    mut hovered: ResMut<HoveredHex>,
+    mut job: ResMut<LoadingJob>,
+    mut progress: ResMut<LoadingProgress>,
+    world_entities: Query<Entity, With<WorldEntity>>,
+    mut cameras: Query<(&mut Transform, &mut OrthographicProjection), With<Camera2d>>,
+) {
+    for interaction in &mut interaction {
+        if *interaction != Interaction::Pressed {
+            continue;
+        }
+
+        for entity in &world_entities {
+            commands.entity(entity).despawn_recursive();
+        }
+        commands.remove_resource::<GameMap>();
+        commands.remove_resource::<GameState>();
+        commands.remove_resource::<GridMesh>();
+        commands.remove_resource::<GridMaterial>();
+
+        selected.0 = None;
+        hovered.0 = None;
+        epoch.0 += 1;
+        *screen = MenuScreen::Closed;
+        *motion = MenuMotion::default();
+        *title = TitleScreen::Home;
+        *job = LoadingJob::None;
+        *progress = LoadingProgress::default();
+
+        if let Ok((mut transform, mut projection)) = cameras.get_single_mut() {
+            *transform = Transform::default();
+            projection.scale = 1.0;
+        }
+
+        next_state.set(AppState::MainMenu);
     }
 }
 
@@ -1621,6 +2095,9 @@ fn reroll_world(
     mut gs: ResMut<GameState>,
     mut game_map: ResMut<GameMap>,
     mut seed_res: ResMut<CurrentSeed>,
+    mut zoom: ResMut<Zoom>,
+    window: Query<&Window, With<PrimaryWindow>>,
+    mut cameras: Query<(&mut Transform, &mut OrthographicProjection), With<Camera2d>>,
     mut text_queries: ParamSet<(
         Query<&mut Text, With<TurnText>>,
         Query<&mut Text, With<SeedText>>,
@@ -1644,6 +2121,21 @@ fn reroll_world(
     let (map, new_gs) = spawn_world_entities(&mut commands, &mut meshes, &mut materials, seed);
     game_map.0 = map;
     *gs = new_gs;
+
+    if let Ok(window) = window.get_single() {
+        let window_size = Vec2::new(window.width(), window.height());
+        if window_size.x > 0.0 && window_size.y > 0.0 {
+            if let Ok((mut transform, mut projection)) = cameras.get_single_mut() {
+                apply_camera_frame_to_tiles(
+                    &game_map.0.tiles,
+                    window_size,
+                    &mut transform,
+                    &mut projection,
+                    &mut zoom.0,
+                );
+            }
+        }
+    }
 
     selected.0 = None;
     hovered.0 = None;

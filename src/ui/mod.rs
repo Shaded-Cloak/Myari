@@ -5,6 +5,7 @@ use bevy::prelude::*;
 
 use crate::app_state::InGameHud;
 
+pub mod hover_gem;
 pub mod loading_screen;
 pub mod title_constellations;
 pub mod title_hex_grid;
@@ -27,10 +28,26 @@ pub const BTN_PRESSED: Color = Color::srgba(0.22, 0.16, 0.10, 1.0);
 
 pub const MENU_BACKDROP: Color = Color::srgba(0.02, 0.02, 0.03, 0.72);
 pub const MENU_ENTER_SECS: f32 = 0.22;
-pub const MENU_EXIT_SECS: f32 = 0.14;
+/// Pause-menu close — fade + shrink together, then done (no post-hide shrink).
+pub const MENU_EXIT_SECS: f32 = 0.22;
 pub const MENU_SWITCH_SECS: f32 = 0.15;
-const MENU_PANEL_START_SCALE: f32 = 0.97;
-const MENU_PANEL_START_Y: f32 = -10.0;
+
+/// Pause-menu layer with an authored base color; alpha is driven by menu motion.
+#[derive(Component, Clone, Copy)]
+pub struct MenuFadeLayer {
+    pub base: Color,
+}
+
+/// Apply a unified fade (0–1) to every [`MenuFadeLayer`] backdrop/panel surface.
+pub fn apply_menu_fade_alpha(
+    alpha: f32,
+    layers: &mut Query<(&MenuFadeLayer, &mut BackgroundColor)>,
+) {
+    let alpha = alpha.clamp(0.0, 1.0);
+    for (layer, mut bg) in &mut *layers {
+        bg.0 = layer.base.with_alpha(layer.base.alpha() * alpha);
+    }
+}
 
 pub fn ease_out_cubic(t: f32) -> f32 {
     let t = t.clamp(0.0, 1.0);
@@ -52,20 +69,42 @@ pub fn smooth_follow_vec2(current: Vec2, target: Vec2, delta_secs: f32, speed: f
     )
 }
 
+/// Exponential follow with speed ramped up as the target gets farther away.
+pub fn smooth_follow_vec2_distance_speed(
+    current: Vec2,
+    target: Vec2,
+    delta_secs: f32,
+    speed_near: f32,
+    speed_far: f32,
+    dist_near: f32,
+    dist_far: f32,
+) -> Vec2 {
+    let dist = current.distance(target);
+    if dist <= f32::EPSILON {
+        return target;
+    }
+    let t = ((dist - dist_near) / (dist_far - dist_near)).clamp(0.0, 1.0);
+    let blend = t * t * (3.0 - 2.0 * t);
+    let speed = speed_near + (speed_far - speed_near) * blend;
+    smooth_follow_vec2(current, target, delta_secs, speed)
+}
+
+const MENU_PANEL_START_SCALE: f32 = 0.94;
+const MENU_PANEL_EXIT_SCALE: f32 = 0.84;
+
 pub fn menu_panel_intro_transform(t: f32) -> Transform {
     let eased = ease_out_cubic(t);
     Transform {
-        translation: Vec3::new(0.0, MENU_PANEL_START_Y * (1.0 - eased), 0.0),
         scale: Vec3::splat(MENU_PANEL_START_SCALE + (1.0 - MENU_PANEL_START_SCALE) * eased),
         ..default()
     }
 }
 
+/// Linear shrink — ease-out was slowing to a crawl while the overlay faded.
 pub fn menu_panel_outro_transform(t: f32) -> Transform {
-    let eased = ease_out_cubic(t);
+    let t = t.clamp(0.0, 1.0);
     Transform {
-        translation: Vec3::new(0.0, -4.0 * eased, 0.0),
-        scale: Vec3::splat(1.0 - 0.015 * eased),
+        scale: Vec3::splat(1.0 + (MENU_PANEL_EXIT_SCALE - 1.0) * t),
         ..default()
     }
 }
@@ -180,6 +219,7 @@ pub fn spawn_framed_panel(
             anchor.outer_node(),
             BackgroundColor(PARCHMENT),
             BorderColor(GOLD),
+            Visibility::Hidden,
             InGameHud,
         ))
         .with_children(|frame| {
@@ -201,38 +241,56 @@ pub fn spawn_framed_panel(
         });
 }
 
+fn menu_panel_node(width: f32) -> Node {
+    Node {
+        width: Val::Px(width),
+        flex_direction: FlexDirection::Column,
+        padding: UiRect::new(Val::Px(22.0), Val::Px(20.0), Val::Px(20.0), Val::Px(22.0)),
+        row_gap: Val::Px(16.0),
+        align_items: AlignItems::Center,
+        border: UiRect::all(Val::Px(1.0)),
+        ..default()
+    }
+}
+
 pub fn menu_panel_bundle(width: f32) -> impl Bundle {
     (
-        Node {
-            width: Val::Px(width),
-            flex_direction: FlexDirection::Column,
-            padding: UiRect::new(Val::Px(22.0), Val::Px(20.0), Val::Px(20.0), Val::Px(22.0)),
-            row_gap: Val::Px(16.0),
-            align_items: AlignItems::Center,
-            border: UiRect::all(Val::Px(1.0)),
-            ..default()
-        },
+        menu_panel_node(width),
         BackgroundColor(PANEL),
         BorderColor(GOLD_DIM),
+    )
+}
+
+pub fn menu_panel_bundle_with_fade(width: f32) -> impl Bundle {
+    (
+        menu_panel_node(width),
+        BackgroundColor(PANEL),
+        BorderColor(GOLD_DIM),
+        MenuFadeLayer { base: PANEL },
     )
 }
 
 pub fn menu_framed_overlay(
     parent: &mut ChildBuilder,
     theme: &UiTheme,
+    fade: bool,
     fill: impl FnOnce(&mut ChildBuilder, &UiTheme),
 ) {
-    parent
-        .spawn((
-            Node {
-                padding: UiRect::all(Val::Px(3.0)),
-                border: UiRect::all(Val::Px(2.0)),
-                ..default()
-            },
-            BackgroundColor(PARCHMENT),
-            BorderColor(GOLD),
-        ))
-        .with_children(|frame| fill(frame, theme));
+    let mut frame = parent.spawn((
+        Node {
+            padding: UiRect::all(Val::Px(3.0)),
+            border: UiRect::all(Val::Px(2.0)),
+            ..default()
+        },
+        BackgroundColor(PARCHMENT),
+        BorderColor(GOLD),
+    ));
+    if fade {
+        frame.insert(MenuFadeLayer {
+            base: PARCHMENT,
+        });
+    }
+    frame.with_children(|frame| fill(frame, theme));
 }
 
 pub fn spawn_ornate_divider(parent: &mut ChildBuilder, theme: &UiTheme) {
@@ -283,6 +341,9 @@ pub fn spawn_star_watermark(parent: &mut ChildBuilder, theme: &UiTheme) {
 #[derive(Component)]
 pub struct MenuButton;
 
+#[derive(Component)]
+pub struct MenuButtonFill;
+
 pub fn menu_button_bundle() -> impl Bundle {
     menu_button_node_bundle(Val::Auto)
 }
@@ -297,15 +358,13 @@ fn menu_button_node_bundle(width: Val) -> impl Bundle {
         Node {
             width,
             height: Val::Px(46.0),
-            padding: UiRect::ZERO,
+            padding: UiRect::all(Val::Px(1.0)),
             justify_content: JustifyContent::Center,
             align_items: AlignItems::Center,
-            border: UiRect::all(Val::Px(1.0)),
             overflow: Overflow::clip(),
             ..default()
         },
-        BackgroundColor(BTN_IDLE),
-        BorderColor(GOLD_DIM),
+        BackgroundColor(GOLD_DIM),
     )
 }
 
@@ -329,6 +388,8 @@ pub fn spawn_menu_button_label(
                 overflow: Overflow::clip(),
                 ..default()
             },
+            MenuButtonFill,
+            BackgroundColor(BTN_IDLE),
         ))
         .with_children(|inner| {
             inner

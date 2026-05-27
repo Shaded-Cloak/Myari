@@ -101,6 +101,26 @@ pub fn pixel_to_hex(x: f32, y: f32, size: f32) -> HexCoord {
     HexCoord::new(h.x, h.y)
 }
 
+/// Axis-aligned world bounds covering every hex in `coords` (flat-top, Y-up).
+pub fn hex_world_bounds(coords: impl IntoIterator<Item = HexCoord>, hex_size: f32) -> (f32, f32, f32, f32) {
+    let half_w = hex_size * 0.866_025_4; // sqrt(3) / 2
+    let half_h = hex_size;
+    let mut min_x = f32::INFINITY;
+    let mut min_y = f32::INFINITY;
+    let mut max_x = f32::NEG_INFINITY;
+    let mut max_y = f32::NEG_INFINITY;
+
+    for coord in coords {
+        let (cx, cy) = axial_to_pixel(coord.q, coord.r, hex_size);
+        min_x = min_x.min(cx - half_w);
+        min_y = min_y.min(cy - half_h);
+        max_x = max_x.max(cx + half_w);
+        max_y = max_y.max(cy + half_h);
+    }
+
+    (min_x, min_y, max_x, max_y)
+}
+
 /// All hexes in a disk centered on the origin.
 pub fn hex_disk(radius: i32) -> Vec<HexCoord> {
     Hex::ZERO
