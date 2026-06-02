@@ -25,11 +25,18 @@ pub const BTN_IDLE: Color = Color::srgba(0.10, 0.08, 0.06, 0.95);
 pub const BTN_HOVER: Color = Color::srgba(0.16, 0.12, 0.08, 0.98);
 pub const BTN_PRESSED: Color = Color::srgba(0.22, 0.16, 0.10, 1.0);
 
-pub const MENU_BACKDROP: Color = Color::srgba(0.02, 0.02, 0.03, 0.72);
 pub const MENU_ENTER_SECS: f32 = 0.22;
 /// Pause-menu close — fade + shrink together, then done (no post-hide shrink).
 pub const MENU_EXIT_SECS: f32 = 0.22;
 pub const MENU_SWITCH_SECS: f32 = 0.15;
+
+/// In-game HUD — above world dim, below pause panel.
+pub const GLOBAL_Z_HUD: i32 = 0;
+/// Pause/settings panel.
+pub const GLOBAL_Z_MENU_PANEL: i32 = 10;
+
+/// Base alpha for the world-space pause dim (not UI — never covers HUD).
+pub const PAUSE_WORLD_DIM_ALPHA: f32 = 0.72;
 
 /// Pause-menu layer with an authored base color; alpha is driven by menu motion.
 #[derive(Component, Clone, Copy)]
@@ -37,15 +44,46 @@ pub struct MenuFadeLayer {
     pub base: Color,
 }
 
-/// Apply a unified fade (0–1) to every [`MenuFadeLayer`] backdrop/panel surface.
+/// Apply a unified fade (0–1) to every [`MenuFadeLayer`] surface (background or text).
 pub fn apply_menu_fade_alpha(
     alpha: f32,
-    layers: &mut Query<(&MenuFadeLayer, &mut BackgroundColor)>,
+    bg_layers: &mut Query<
+        (&MenuFadeLayer, &mut BackgroundColor),
+        (Without<Text>, With<MenuFadeLayer>),
+    >,
+    text_layers: &mut Query<
+        (&MenuFadeLayer, &mut TextColor, &mut BackgroundColor),
+        With<Text>,
+    >,
 ) {
     let alpha = alpha.clamp(0.0, 1.0);
-    for (layer, mut bg) in &mut *layers {
+    let bg_count = bg_layers.iter().count();
+    let text_count = text_layers.iter().count();
+    for (layer, mut bg) in &mut *bg_layers {
         bg.0 = layer.base.with_alpha(layer.base.alpha() * alpha);
     }
+    for (layer, mut text, mut bg) in &mut *text_layers {
+        text.0 = layer.base.with_alpha(layer.base.alpha() * alpha);
+        // Node requires BackgroundColor; keep text nodes visually transparent.
+        bg.0 = Color::NONE;
+    }
+    // #region agent log
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("debug-a40c64.log")
+    {
+        use std::io::Write;
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        let _ = writeln!(
+            f,
+            r#"{{"sessionId":"a40c64","runId":"post-fix","hypothesisId":"H1","location":"ui/mod.rs:apply_menu_fade_alpha","message":"fade applied globally","data":{{"alpha":{alpha},"bg_count":{bg_count},"text_count":{text_count}}},"timestamp":{ts}}}"#
+        );
+    }
+    // #endregion
 }
 
 pub fn ease_out_cubic(t: f32) -> f32 {
@@ -173,12 +211,13 @@ impl UiTheme {
 
 pub enum HudAnchor {
     TopLeft { left: f32, top: f32 },
+    TopCenter { top: f32 },
     TopRight { right: f32, top: f32 },
     BottomLeft { left: f32, bottom: f32 },
 }
 
 impl HudAnchor {
-    fn outer_node(self) -> Node {
+    pub fn outer_node(self) -> Node {
         let mut node = Node {
             position_type: PositionType::Absolute,
             padding: UiRect::all(Val::Px(3.0)),
@@ -189,6 +228,14 @@ impl HudAnchor {
             HudAnchor::TopLeft { left, top } => {
                 node.left = Val::Px(left);
                 node.top = Val::Px(top);
+            }
+            HudAnchor::TopCenter { top } => {
+                node.left = Val::Px(0.0);
+                node.right = Val::Px(0.0);
+                node.top = Val::Px(top);
+                node.width = Val::Percent(100.0);
+                node.justify_content = JustifyContent::Center;
+                node.align_items = AlignItems::Center;
             }
             HudAnchor::TopRight { right, top } => {
                 node.right = Val::Px(right);
@@ -219,6 +266,7 @@ pub fn spawn_framed_panel(
             BackgroundColor(PARCHMENT),
             BorderColor(GOLD),
             Visibility::Hidden,
+            GlobalZIndex(GLOBAL_Z_HUD),
             InGameHud,
         ))
         .with_children(|frame| {
@@ -292,7 +340,7 @@ pub fn menu_framed_overlay(
     frame.with_children(|frame| fill(frame, theme));
 }
 
-pub fn spawn_ornate_divider(parent: &mut ChildBuilder, theme: &UiTheme) {
+pub fn spawn_ornate_divider(parent: &mut ChildBuilder, theme: &UiTheme, fade: bool) {
     parent
         .spawn((
             Node {
@@ -305,7 +353,7 @@ pub fn spawn_ornate_divider(parent: &mut ChildBuilder, theme: &UiTheme) {
             },
         ))
         .with_children(|rule| {
-            rule.spawn((
+            let mut left = rule.spawn((
                 Node {
                     flex_grow: 1.0,
                     height: Val::Px(1.0),
@@ -313,8 +361,11 @@ pub fn spawn_ornate_divider(parent: &mut ChildBuilder, theme: &UiTheme) {
                 },
                 BackgroundColor(GOLD_DIM),
             ));
-            spawn_star_ornament(rule, theme, 13.0);
-            rule.spawn((
+            if fade {
+                left.insert(MenuFadeLayer { base: GOLD_DIM });
+            }
+            spawn_star_ornament(rule, theme, 13.0, fade);
+            let mut right = rule.spawn((
                 Node {
                     flex_grow: 1.0,
                     height: Val::Px(1.0),
@@ -322,11 +373,17 @@ pub fn spawn_ornate_divider(parent: &mut ChildBuilder, theme: &UiTheme) {
                 },
                 BackgroundColor(GOLD_DIM),
             ));
+            if fade {
+                right.insert(MenuFadeLayer { base: GOLD_DIM });
+            }
         });
 }
 
-pub fn spawn_star_ornament(parent: &mut ChildBuilder, theme: &UiTheme, size: f32) {
-    parent.spawn(theme.star(size));
+pub fn spawn_star_ornament(parent: &mut ChildBuilder, theme: &UiTheme, size: f32, fade: bool) {
+    let mut star = parent.spawn(theme.star(size));
+    if fade {
+        star.insert(MenuFadeLayer { base: GOLD });
+    }
 }
 
 pub fn spawn_star_watermark(parent: &mut ChildBuilder, theme: &UiTheme) {
@@ -360,6 +417,7 @@ fn menu_button_node_bundle(width: Val) -> impl Bundle {
             ..default()
         },
         BackgroundColor(GOLD_DIM),
+        MenuFadeLayer { base: GOLD_DIM },
     )
 }
 
@@ -385,6 +443,7 @@ pub fn spawn_menu_button_label(
             },
             MenuButtonFill,
             BackgroundColor(BTN_IDLE),
+            MenuFadeLayer { base: BTN_IDLE },
         ))
         .with_children(|inner| {
             inner
@@ -403,6 +462,7 @@ pub fn spawn_menu_button_label(
                     label.spawn((
                         theme.value(text, 17.0),
                         TextLayout::new_with_no_wrap(),
+                        MenuFadeLayer { base: CREAM },
                         extra,
                     ));
                 });

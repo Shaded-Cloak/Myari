@@ -1,5 +1,5 @@
 mod app_state;
-mod center_island;
+mod buildings;
 mod game;
 mod hexgrid;
 mod map;
@@ -8,6 +8,7 @@ mod rng;
 mod ui;
 
 use app_state::{AppState, InGameHud, LoadingJob, LoadingProgress};
+use bevy::hierarchy::Parent;
 use bevy::color::Color;
 use bevy::input::keyboard::KeyCode;
 use bevy::input::mouse::MouseButton;
@@ -19,8 +20,9 @@ use bevy::transform::TransformSystem;
 use bevy::ui::UiSystem;
 use bevy_pancam::{PanCam, PanCamPlugin};
 use rand::Rng;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
+use buildings::{can_place_lodge, lodge_coords};
 use game::GameState;
 use crate::hexgrid::{axial_to_pixel, hex_corners_at, hex_corners_local, hex_world_bounds, pixel_to_hex, HexCoord};
 use map::{Map, HexTile, TerrainType, MAP_RADIUS};
@@ -32,9 +34,11 @@ use ui::{
     spawn_ornate_divider, spawn_star_watermark, title_menu::{
         self, spawn_title_menu, sync_title_subscreen, TitleRoot, TitleScreen,
     },
-    apply_menu_fade_alpha, ease_out_cubic, HudAnchor, MenuButton, MenuButtonFill, MenuFadeLayer,
+    apply_menu_fade_alpha, ease_out_cubic, smooth_follow_vec2_distance_speed, HudAnchor,
+    MenuButton, MenuButtonFill, MenuFadeLayer,
     UiTheme, BTN_HOVER, BTN_IDLE, BTN_PRESSED,
-    GOLD, MENU_BACKDROP, MENU_ENTER_SECS, MENU_EXIT_SECS, MENU_SWITCH_SECS,
+    CREAM, GOLD, HINT, MENU_ENTER_SECS, MENU_EXIT_SECS, MENU_SWITCH_SECS,
+    GLOBAL_Z_HUD, GLOBAL_Z_MENU_PANEL, PAUSE_WORLD_DIM_ALPHA,
 };
 
 const HEX_SIZE: f32 = 28.0;
@@ -42,16 +46,28 @@ const MIN_LOAD_SECS: f32 = 1.55;
 const LOAD_INTRO_SECS: f32 = 0.35;
 const LOAD_WORLD_SECS: f32 = 0.55;
 const LOAD_UI_SECS: f32 = 0.45;
-/// One hex step — short ease-out slide between tile centres.
-const HOVER_HOP_NEIGHBOR_SECS: f32 = 0.09;
-/// Two hex steps — quick catch-up.
-const HOVER_HOP_TWO_SECS: f32 = 0.048;
+/// Hover ring thickness in world units — scales with the map when zooming.
+const HOVER_OUTLINE_STROKE: f32 = 2.2;
+/// Map border thickness in world units — scales with the map when zooming.
+const MAP_BORDER_STROKE: f32 = 24.0;
+/// Slow drift onto the hovered tile; ramps up when the cursor skips ahead.
+const HOVER_GLOW_SPEED_NEAR: f32 = 7.5;
+const HOVER_GLOW_SPEED_FAR: f32 = 16.0;
+/// Full alpha/scale pulse cycle (~2.8s).
+const HOVER_GLOW_PULSE_HZ: f32 = 0.36;
+const HOVER_GLOW_PULSE_SCALE: f32 = 0.032;
+const HOVER_GLOW_ALPHA_BASE: f32 = 0.84;
+const HOVER_GLOW_ALPHA_AMP: f32 = 0.12;
 /// Extra margin so the map isn't flush against the screen edge.
 const MAP_CAMERA_PADDING: f32 = 1.06;
 /// Grid fully visible when hex height on screen is at least this many pixels.
 const GRID_HEX_PX_FADE_START: f32 = 28.0;
 /// Grid hidden when hex height on screen is at or below this (only at extreme zoom-out).
 const GRID_HEX_PX_FADE_END: f32 = 7.0;
+/// Placeholder fill for a placed hunting lodge hex.
+const LODGE_TILE_BROWN: Color = Color::srgb(0.45, 0.28, 0.12);
+const LODGE_GHOST_VALID: Color = Color::srgba(0.85, 0.72, 0.35, 0.88);
+const LODGE_GHOST_INVALID: Color = Color::srgba(0.9, 0.25, 0.2, 0.88);
 
 fn main() {
     println!("Myari starting up...");
@@ -68,6 +84,8 @@ fn main() {
         .init_state::<AppState>()
         .init_resource::<SelectedHex>()
         .init_resource::<HoveredHex>()
+        .init_resource::<BuildingPlacementMode>()
+        .init_resource::<PlacedLodges>()
         .init_resource::<FpsCounter>()
         .init_resource::<GridVisible>()
         .init_resource::<MenuScreen>()
@@ -136,6 +154,7 @@ fn main() {
             OnEnter(AppState::InGame),
             (
                 reset_pause_menu_for_session,
+                restore_hud_ornament_colors,
                 frame_camera_to_map,
                 reset_hover_highlight_on_enter,
             )
@@ -158,9 +177,20 @@ fn main() {
                 (handle_toggle_button, sync_grid_for_zoom).chain(),
                 fps_update,
                 end_turn,
+            )
+                .run_if(in_state(AppState::InGame)),
+        )
+        .add_systems(
+            Update,
+            (
                 reroll_world,
                 save_game,
                 load_game,
+                update_lodge_placement_ghost,
+                handle_hunting_lodge_button,
+                sync_hunting_lodge_toolbar,
+                handle_lodge_placement_click,
+                cancel_lodge_placement_on_escape,
             )
                 .run_if(in_state(AppState::InGame)),
         )
@@ -168,6 +198,9 @@ fn main() {
             PostUpdate,
             (
                 update_menu_motion,
+                sync_open_pause_menu_fade,
+                sync_pause_world_dim,
+                debug_log_hud_ornament_fade,
                 sync_pancam.after(update_menu_motion),
             )
                 .run_if(in_state(AppState::InGame))
@@ -185,6 +218,118 @@ fn main() {
 
 // ── Resources ───────────────────────────────────────────────────
 
+fn is_under_hud(entity: Entity, hud_roots: &std::collections::HashSet<Entity>, parents: &Query<&Parent>) -> bool {
+    let mut current = Some(entity);
+    while let Some(e) = current {
+        if hud_roots.contains(&e) {
+            return true;
+        }
+        current = parents.get(e).ok().map(|p| p.get());
+    }
+    false
+}
+
+/// #region agent log
+fn debug_log_hud_ornament_fade(
+    screen: Res<MenuScreen>,
+    hud: Query<Entity, With<InGameHud>>,
+    parents: Query<&Parent>,
+    ornaments: Query<(Entity, &BackgroundColor), (With<MenuFadeLayer>, Without<Text>)>,
+) {
+    if !screen.is_changed() {
+        return;
+    }
+    let hud_roots: std::collections::HashSet<Entity> = hud.iter().collect();
+    let mut hud_ornament_count = 0u32;
+    let mut hud_ornament_invisible = 0u32;
+    let mut sample_alphas: Vec<f32> = Vec::new();
+    for (entity, bg) in &ornaments {
+        if !is_under_hud(entity, &hud_roots, &parents) {
+            continue;
+        }
+        hud_ornament_count += 1;
+        let a = bg.0.alpha();
+        if sample_alphas.len() < 4 {
+            sample_alphas.push(a);
+        }
+        if a < 0.05 {
+            hud_ornament_invisible += 1;
+        }
+    }
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("debug-a40c64.log")
+    {
+        use std::io::Write;
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        let screen_name = format!("{:?}", *screen);
+        let alphas = sample_alphas
+            .iter()
+            .map(|a| format!("{a:.3}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let _ = writeln!(
+            f,
+            r#"{{"sessionId":"a40c64","runId":"post-fix","hypothesisId":"H3","location":"main.rs:debug_log_hud_ornament_fade","message":"hud ornament alpha on menu screen change","data":{{"screen":"{screen_name}","hud_ornament_count":{hud_ornament_count},"hud_ornament_invisible":{hud_ornament_invisible},"sample_alphas":"[{alphas}]"}},"timestamp":{ts}}}"#
+        );
+    }
+}
+/// #endregion
+
+fn restore_hud_ornament_colors(
+    mut commands: Commands,
+    hud: Query<Entity, With<InGameHud>>,
+    parents: Query<&Parent>,
+    mut bg_ornaments: Query<
+        (Entity, &MenuFadeLayer, &mut BackgroundColor),
+        (Without<Text>, With<MenuFadeLayer>),
+    >,
+    mut text_ornaments: Query<
+        (Entity, &MenuFadeLayer, &mut TextColor),
+        (With<Text>, With<MenuFadeLayer>),
+    >,
+) {
+    let hud_roots: std::collections::HashSet<Entity> = hud.iter().collect();
+    let mut restored = 0u32;
+    for (entity, layer, mut bg) in &mut bg_ornaments {
+        if !is_under_hud(entity, &hud_roots, &parents) {
+            continue;
+        }
+        bg.0 = layer.base;
+        commands.entity(entity).remove::<MenuFadeLayer>();
+        restored += 1;
+    }
+    for (entity, layer, mut text) in &mut text_ornaments {
+        if !is_under_hud(entity, &hud_roots, &parents) {
+            continue;
+        }
+        text.0 = layer.base;
+        commands.entity(entity).remove::<MenuFadeLayer>();
+        restored += 1;
+    }
+    // #region agent log
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("debug-a40c64.log")
+    {
+        use std::io::Write;
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        let _ = writeln!(
+            f,
+            r#"{{"sessionId":"a40c64","runId":"post-fix","hypothesisId":"H3","location":"main.rs:restore_hud_ornament_colors","message":"restored hud ornaments","data":{{"restored":{restored}}},"timestamp":{ts}}}"#
+        );
+    }
+    // #endregion
+}
+
 #[derive(Resource, Default)]
 struct SelectedHex(Option<HexCoord>);
 
@@ -196,6 +341,39 @@ struct CurrentSeed(u64);
 
 #[derive(Resource, Default)]
 struct HoveredHex(Option<HexCoord>);
+
+#[derive(Resource, Default, PartialEq, Eq)]
+enum BuildingPlacementMode {
+    #[default]
+    Idle,
+    PlacingHuntingLodge,
+}
+
+impl BuildingPlacementMode {
+    fn is_placing_lodge(&self) -> bool {
+        matches!(self, BuildingPlacementMode::PlacingHuntingLodge)
+    }
+}
+
+#[derive(Resource, Default)]
+struct PlacedLodges {
+    anchors: Vec<HexCoord>,
+    occupied: HashSet<HexCoord>,
+}
+
+#[derive(Component)]
+struct HuntingLodgeButton;
+
+#[derive(Component)]
+struct HuntingLodgeButtonLabel;
+
+#[derive(Component)]
+struct LodgeGhost {
+    slot: u8,
+}
+
+#[derive(Component)]
+struct LodgeTile;
 
 #[derive(Resource, Default)]
 struct FpsCounter {
@@ -211,30 +389,6 @@ struct FpsText;
 #[derive(Component)]
 struct Highlight;
 
-#[derive(Component, Default)]
-struct HighlightHop {
-    from: Vec2,
-    to: Vec2,
-    elapsed: f32,
-    duration: f32,
-}
-
-fn hover_hop_duration(hex_steps: i32) -> f32 {
-    match hex_steps {
-        0 => 0.0,
-        1 => HOVER_HOP_NEIGHBOR_SECS,
-        2 => HOVER_HOP_TWO_SECS,
-        _ => 0.0,
-    }
-}
-
-fn start_highlight_hop(hop: &mut HighlightHop, from: Vec2, to: Vec2, hex_steps: i32) {
-    hop.from = from;
-    hop.to = to;
-    hop.elapsed = 0.0;
-    hop.duration = hover_hop_duration(hex_steps);
-}
-
 #[derive(Resource)]
 struct GridMaterial(Handle<ColorMaterial>);
 
@@ -244,7 +398,7 @@ struct GridVisible(bool);
 #[derive(Resource, Default)]
 struct MenuScreenEpoch(u32);
 
-#[derive(Resource, Default, PartialEq, Eq, Clone, Copy)]
+#[derive(Resource, Default, PartialEq, Eq, Clone, Copy, Debug)]
 enum MenuScreen {
     #[default]
     Closed,
@@ -282,6 +436,19 @@ impl Default for Zoom {
 }
 
 #[derive(Component)]
+struct PauseWorldDim;
+
+#[derive(Resource)]
+struct PauseDimMaterial(Handle<ColorMaterial>);
+
+const PAUSE_DIM_Z: f32 = 3.0;
+/// Gold map perimeter — above internal grid, below hover highlight.
+const MAP_BORDER_Z: f32 = 4.7;
+
+#[derive(Component)]
+struct PauseMenuLayer;
+
+#[derive(Component)]
 struct MenuRoot;
 
 #[derive(Component)]
@@ -310,6 +477,15 @@ pub struct GridToggleLabel;
 
 #[derive(Component)]
 struct GridMarker;
+
+#[derive(Component)]
+struct MapBorder;
+
+struct MapBorderEdge {
+    a: Vec2,
+    b: Vec2,
+    outward: Vec2,
+}
 
 #[derive(Component)]
 struct TurnText;
@@ -370,13 +546,20 @@ fn sync_pancam(
     app_state: Res<State<AppState>>,
     screen: Res<MenuScreen>,
     motion: Res<MenuMotion>,
+    placement: Res<BuildingPlacementMode>,
     mut cameras: Query<&mut PanCam>,
 ) {
     if let Ok(mut pan) = cameras.get_single_mut() {
         let pause_visible = *screen != MenuScreen::Closed
             || motion.phase == MenuMotionPhase::Exit
             || motion.phase == MenuMotionPhase::Teardown;
-        pan.enabled = *app_state.get() == AppState::InGame && !pause_visible;
+        let in_game = *app_state.get() == AppState::InGame && !pause_visible;
+        pan.enabled = in_game;
+        if in_game && placement.is_placing_lodge() {
+            pan.grab_buttons = vec![MouseButton::Middle];
+        } else {
+            pan.grab_buttons = vec![MouseButton::Left, MouseButton::Middle];
+        }
     }
 }
 
@@ -503,8 +686,15 @@ fn sync_app_screens(
     app_state: Res<State<AppState>>,
     mut title: Query<&mut Node, With<TitleRoot>>,
     mut loading: Query<&mut Node, (With<LoadingRoot>, Without<TitleRoot>)>,
-    mut pause: Query<&mut Node, (With<MenuRoot>, Without<TitleRoot>, Without<LoadingRoot>)>,
-    mut hud: Query<&mut Visibility, With<InGameHud>>,
+    mut pause: Query<
+        &mut Node,
+        (
+            With<PauseMenuLayer>,
+            Without<TitleRoot>,
+            Without<LoadingRoot>,
+        ),
+    >,
+    mut hud: Query<&mut Visibility, (With<InGameHud>, Without<Highlight>)>,
 ) {
     let state = app_state.get();
     if app_state.is_changed() {
@@ -522,7 +712,7 @@ fn sync_app_screens(
                 Display::None
             };
         }
-        if let Ok(mut node) = pause.get_single_mut() {
+        for mut node in &mut pause {
             if *state == AppState::InGame {
                 // Keep in the layout tree while in-game; open/close uses Visibility to avoid reflow hitches.
                 node.display = Display::Flex;
@@ -653,16 +843,25 @@ fn loading_pipeline(
                     fps_startup(&mut commands, &theme);
                     spawn_game_hud(&mut commands, &theme, seed_res.0);
                     spawn_hover_panel(&mut commands, &theme, &mut images);
-                    let hm = meshes.add(make_hex_outline_mesh(HEX_SIZE));
+                    spawn_building_toolbar(&mut commands, &theme);
+                    let hm = meshes.add(make_hex_ring_mesh(HEX_SIZE, HOVER_OUTLINE_STROKE));
                     commands.spawn((
                         Mesh2d(hm),
                         MeshMaterial2d(materials.add(ColorMaterial::from_color(GOLD))),
                         Transform::from_xyz(0.0, 0.0, 5.0),
                         Visibility::Hidden,
                         Highlight,
-                        HighlightHop::default(),
-                        InGameHud,
                     ));
+                    let ghost_mesh = meshes.add(make_hex_ring_mesh(HEX_SIZE, HOVER_OUTLINE_STROKE));
+                    for slot in 0..4u8 {
+                        commands.spawn((
+                            Mesh2d(ghost_mesh.clone()),
+                            MeshMaterial2d(materials.add(ColorMaterial::from_color(LODGE_GHOST_VALID))),
+                            Transform::from_xyz(0.0, 0.0, 5.0),
+                            Visibility::Hidden,
+                            LodgeGhost { slot },
+                        ));
+                    }
                     ui_ready.0 = true;
                 }
 
@@ -718,6 +917,32 @@ fn load_saved_game() -> Result<SaveData, ()> {
     serde_json::from_str(&text).map_err(|_| ())
 }
 
+fn spawn_building_toolbar(commands: &mut Commands, theme: &UiTheme) {
+    commands
+        .spawn((
+            HudAnchor::TopCenter { top: 18.0 }.outer_node(),
+            Visibility::Hidden,
+            GlobalZIndex(GLOBAL_Z_HUD),
+            InGameHud,
+        ))
+        .with_children(|bar| {
+            bar.spawn(Node {
+                width: Val::Px(220.0),
+                ..default()
+            })
+            .with_children(|wrap| {
+                wrap.spawn((
+                    menu_button_row_bundle(),
+                    MenuButton,
+                    HuntingLodgeButton,
+                ))
+                .with_children(|btn| {
+                    spawn_menu_button_label(btn, theme, "Hunting Lodge", HuntingLodgeButtonLabel);
+                });
+            });
+        });
+}
+
 fn spawn_game_hud(commands: &mut Commands, theme: &UiTheme, seed: u64) {
     spawn_framed_panel(
         commands,
@@ -732,7 +957,7 @@ fn spawn_game_hud(commands: &mut Commands, theme: &UiTheme, seed: u64) {
         |panel, theme| {
             panel.spawn(theme.label("TURN"));
             panel.spawn((theme.value("1", 22.0), TurnText));
-            spawn_ornate_divider(panel, theme);
+            spawn_ornate_divider(panel, theme, false);
             panel.spawn(theme.label("SEED"));
             panel.spawn((theme.value(seed.to_string(), 15.0), SeedText));
             panel.spawn(theme.hint("Press R to reroll world", 11.0));
@@ -783,7 +1008,7 @@ fn spawn_hover_panel(commands: &mut Commands, theme: &UiTheme, images: &mut Asse
                     block.spawn((theme.value("—", 19.0), HoverCategoryText));
                 });
 
-            spawn_ornate_divider(panel, theme);
+            spawn_ornate_divider(panel, theme, false);
 
             panel
                 .spawn((
@@ -901,6 +1126,8 @@ fn load_game(
         Query<&mut Text, With<SeedText>>,
     )>,
     world_entities: Query<Entity, With<WorldEntity>>,
+    mut placement_mode: ResMut<BuildingPlacementMode>,
+    mut placed_lodges: ResMut<PlacedLodges>,
 ) {
     if !keys.just_pressed(KeyCode::F9) {
         return;
@@ -913,6 +1140,9 @@ fn load_game(
     for e in &world_entities {
         commands.entity(e).despawn_recursive();
     }
+
+    *placement_mode = BuildingPlacementMode::Idle;
+    *placed_lodges = PlacedLodges::default();
 
     seed_res.0 = data.seed;
     let map = Map::from_tiles(data.tiles);
@@ -972,10 +1202,71 @@ fn spawn_world_visuals(
         WorldEntity,
     ));
 
+    let dim_mat = spawn_pause_world_dim(commands, meshes, materials, &map.tiles);
+    commands.insert_resource(PauseDimMaterial(dim_mat));
+
+    let border_edges = build_map_border_path(&map.tiles, HEX_SIZE);
+    let border_mesh = meshes.add(make_map_border_stroke_from_edges(
+        &border_edges,
+        MAP_BORDER_STROKE,
+    ));
+    commands.spawn((
+        Mesh2d(border_mesh),
+        MeshMaterial2d(materials.add(ColorMaterial::from_color(GOLD))),
+        Transform::from_xyz(0.0, 0.0, MAP_BORDER_Z),
+        Visibility::Hidden,
+        MapBorder,
+        WorldEntity,
+    ));
+
     // Civilization city/unit markers temporarily disabled — game state still
     // tracks them, but we don't draw the red/blue/green dots yet.
     // spawn_civ_markers(commands, meshes, materials, gs);
     let _ = (commands, meshes, materials, gs);
+}
+
+fn spawn_pause_world_dim(
+    commands: &mut Commands,
+    meshes: &mut ResMut<Assets<Mesh>>,
+    materials: &mut ResMut<Assets<ColorMaterial>>,
+    tiles: &[HexTile],
+) -> Handle<ColorMaterial> {
+    let (min_x, min_y, max_x, max_y) =
+        hex_world_bounds(tiles.iter().map(|t| t.coord), HEX_SIZE);
+    let pad = HEX_SIZE * 2.0;
+    let w = max_x - min_x + pad;
+    let h = max_y - min_y + pad;
+    let mat = materials.add(ColorMaterial::from_color(Color::srgba(
+        0.02,
+        0.02,
+        0.03,
+        0.0,
+    )));
+    commands.spawn((
+        Mesh2d(meshes.add(Rectangle::new(w, h))),
+        MeshMaterial2d(mat.clone()),
+        Transform::from_xyz((min_x + max_x) * 0.5, (min_y + max_y) * 0.5, PAUSE_DIM_Z),
+        Visibility::Hidden,
+        PauseWorldDim,
+        WorldEntity,
+    ));
+    mat
+}
+
+fn apply_pause_world_dim_alpha(
+    alpha: f32,
+    materials: &mut Assets<ColorMaterial>,
+    handle: &Handle<ColorMaterial>,
+) {
+    let alpha = alpha.clamp(0.0, 1.0);
+    if let Some(mat) = materials.get_mut(handle) {
+        mat.color = Color::srgba(
+            0.02,
+            0.02,
+            0.03,
+            PAUSE_WORLD_DIM_ALPHA * alpha,
+        );
+    }
 }
 
 #[allow(dead_code)] // temporarily disabled — see spawn_world_visuals
@@ -1027,14 +1318,201 @@ fn spawn_world_entities(
 
 // ── Mesh helpers ────────────────────────────────────────────────
 
-fn make_hex_outline_mesh(size: f32) -> Mesh {
-    let mut positions: Vec<[f32; 3]> = hex_corners_local(size)
-        .iter()
-        .map(|&(x, y)| [x, y, 0.0])
-        .collect();
-    positions.push(positions[0]);
-    let indices: Vec<u32> = (0..positions.len() as u32).collect();
-    let mut mesh = Mesh::new(PrimitiveTopology::LineStrip, Default::default());
+fn border_vertex_key(v: Vec2) -> (i32, i32) {
+    ((v.x * 16.0).round() as i32, (v.y * 16.0).round() as i32)
+}
+
+fn dedupe_outwards(outwards: &[Vec2]) -> Vec<Vec2> {
+    let mut unique: Vec<Vec2> = Vec::new();
+    for &o in outwards {
+        let o = o.normalize_or_zero();
+        if o.length_squared() < 1e-8 {
+            continue;
+        }
+        if unique.iter().any(|u| u.dot(o) > 0.995) {
+            continue;
+        }
+        unique.push(o);
+    }
+    unique
+}
+
+fn vertex_bevel_offset(outwards: &[Vec2], half: f32) -> (Vec2, Vec2) {
+    let unique = dedupe_outwards(outwards);
+    if unique.is_empty() {
+        return (Vec2::ZERO, Vec2::ZERO);
+    }
+    if unique.len() == 1 {
+        let o = unique[0] * half;
+        return (o, -o);
+    }
+    let sum: Vec2 = unique.iter().copied().sum();
+    let n = sum.normalize_or_zero();
+    if n.length_squared() < 1e-8 {
+        let o = unique[0] * half;
+        return (o, -o);
+    }
+    (n * half, -n * half)
+}
+
+fn exterior_edge_outward(tile_center: Vec2, a: Vec2, b: Vec2) -> Vec2 {
+    let mid = (a + b) * 0.5;
+    let edge = b - a;
+    let len = edge.length();
+    if len < 1e-6 {
+        return Vec2::ZERO;
+    }
+    let tangent = edge / len;
+    let normal = Vec2::new(tangent.y, -tangent.x);
+    let to_out = mid - tile_center;
+    if normal.dot(to_out) > 0.0 {
+        normal.normalize_or_zero()
+    } else {
+        (-normal).normalize_or_zero()
+    }
+}
+
+fn build_map_border_path(tiles: &[HexTile], hex_size: f32) -> Vec<MapBorderEdge> {
+    let coords: HashSet<HexCoord> = tiles.iter().map(|t| t.coord).collect();
+    let mut edges = Vec::new();
+    for tile in tiles {
+        let (cx, cy) = axial_to_pixel(tile.coord.q, tile.coord.r, hex_size);
+        let center = Vec2::new(cx, cy);
+        let corners = hex_corners_at(tile.coord.q, tile.coord.r, hex_size);
+        let neighbors = tile.coord.neighbors();
+        for i in 0..6 {
+            if coords.contains(&neighbors[i]) {
+                continue;
+            }
+            let a = Vec2::new(corners[i].0, corners[i].1);
+            let b = Vec2::new(corners[(i + 1) % 6].0, corners[(i + 1) % 6].1);
+            edges.push(MapBorderEdge {
+                a,
+                b,
+                outward: exterior_edge_outward(center, a, b),
+            });
+        }
+    }
+    edges
+}
+
+fn append_stroke_quad(
+    positions: &mut Vec<[f32; 3]>,
+    indices: &mut Vec<u32>,
+    o_a: Vec2,
+    o_b: Vec2,
+    i_b: Vec2,
+    i_a: Vec2,
+) {
+    let base = positions.len() as u32;
+    positions.extend([
+        [o_a.x, o_a.y, 0.0],
+        [o_b.x, o_b.y, 0.0],
+        [i_b.x, i_b.y, 0.0],
+        [i_a.x, i_a.y, 0.0],
+    ]);
+    indices.extend([base, base + 1, base + 2, base, base + 2, base + 3]);
+}
+
+fn make_map_border_stroke_from_edges(edges: &[MapBorderEdge], stroke: f32) -> Mesh {
+    let half = stroke * 0.5;
+    let mut vertex_outwards: HashMap<(i32, i32), Vec<Vec2>> = HashMap::new();
+    for edge in edges {
+        if edge.outward.length_squared() < 1e-8 {
+            continue;
+        }
+        vertex_outwards
+            .entry(border_vertex_key(edge.a))
+            .or_default()
+            .push(edge.outward);
+        vertex_outwards
+            .entry(border_vertex_key(edge.b))
+            .or_default()
+            .push(edge.outward);
+    }
+
+    let mut positions = Vec::with_capacity(edges.len() * 4);
+    let mut indices = Vec::with_capacity(edges.len() * 6);
+    for edge in edges {
+        if edge.outward.length_squared() < 1e-8 {
+            continue;
+        }
+        let (o_a, i_a) = vertex_bevel_offset(
+            vertex_outwards
+                .get(&border_vertex_key(edge.a))
+                .map(|v| v.as_slice())
+                .unwrap_or(&[]),
+            half,
+        );
+        let (o_b, i_b) = vertex_bevel_offset(
+            vertex_outwards
+                .get(&border_vertex_key(edge.b))
+                .map(|v| v.as_slice())
+                .unwrap_or(&[]),
+            half,
+        );
+        append_stroke_quad(
+            &mut positions,
+            &mut indices,
+            edge.a + o_a,
+            edge.b + o_b,
+            edge.b + i_b,
+            edge.a + i_a,
+        );
+    }
+    let mut mesh = Mesh::new(PrimitiveTopology::TriangleList, Default::default());
+    mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, positions);
+    mesh.insert_indices(Indices::U32(indices));
+    mesh
+}
+
+fn make_hex_fill_mesh(size: f32) -> Mesh {
+    let (cx, cy) = (0.0_f32, 0.0_f32);
+    let corners = hex_corners_local(size);
+    let c = LODGE_TILE_BROWN.to_linear().to_f32_array();
+    let mut positions: Vec<[f32; 3]> = Vec::with_capacity(7);
+    let mut colors: Vec<[f32; 4]> = Vec::with_capacity(7);
+    positions.push([cx, cy, 0.0]);
+    colors.push(c);
+    for &(x, y) in &corners {
+        positions.push([x, y, 0.0]);
+        colors.push(c);
+    }
+    let mut indices: Vec<u32> = Vec::with_capacity(18);
+    for i in 0..6 {
+        indices.push(0);
+        indices.push(1 + i);
+        indices.push(1 + ((i + 1) % 6));
+    }
+    let mut mesh = Mesh::new(PrimitiveTopology::TriangleList, Default::default());
+    mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, positions);
+    mesh.insert_attribute(Mesh::ATTRIBUTE_COLOR, colors);
+    mesh.insert_indices(Indices::U32(indices));
+    mesh
+}
+
+/// One continuous hex ring — inner/outer contours share vertices at each corner.
+fn make_hex_ring_mesh(corner_radius: f32, stroke: f32) -> Mesh {
+    let half = stroke * 0.5;
+    let inner = hex_corners_local(corner_radius - half);
+    let outer = hex_corners_local(corner_radius + half);
+    let mut positions = Vec::with_capacity(12);
+    for &(x, y) in &inner {
+        positions.push([x, y, 0.0]);
+    }
+    for &(x, y) in &outer {
+        positions.push([x, y, 0.0]);
+    }
+    let mut indices = Vec::with_capacity(36);
+    for i in 0..6u32 {
+        let next = (i + 1) % 6;
+        let i_in = i;
+        let o_in = i + 6;
+        let o_out = next + 6;
+        let i_out = next;
+        indices.extend([i_in, o_in, o_out, i_in, o_out, i_out]);
+    }
+    let mut mesh = Mesh::new(PrimitiveTopology::TriangleList, Default::default());
     mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, positions);
     mesh.insert_indices(Indices::U32(indices));
     mesh
@@ -1142,11 +1620,6 @@ fn terrain_to_color(t: TerrainType) -> Color {
         TerrainType::BlightedWaste => Color::srgb_u8(0x3a, 0x1a, 0x4a),
         TerrainType::RuinField => Color::srgb_u8(0x5a, 0x4a, 0x38),
         TerrainType::SacredGround => Color::srgb_u8(0xc8, 0xa8, 0x30),
-        TerrainType::Cinderfield => Color::srgb_u8(0xb5, 0x47, 0x1c),
-        TerrainType::Rootfield => Color::srgb_u8(0x1b, 0x6b, 0x45),
-        TerrainType::Duskwood => Color::srgb_u8(0x2d, 0x4a, 0x2a),
-        TerrainType::Frostpine => Color::srgb_u8(0x2a, 0x3d, 0x4a),
-        TerrainType::Ashgrove => Color::srgb_u8(0x9a, 0x50, 0x20),
     }
 }
 
@@ -1177,59 +1650,206 @@ fn track_hover(
 fn animate_hover_highlight(
     time: Res<Time>,
     hovered: Res<HoveredHex>,
-    mut query: Query<(&mut Transform, &mut Visibility, &mut HighlightHop), With<Highlight>>,
-    mut prev_hex: Local<Option<HexCoord>>,
+    mut materials: ResMut<Assets<ColorMaterial>>,
+    mut query: Query<
+        (&mut Transform, &mut Visibility, &MeshMaterial2d<ColorMaterial>),
+        With<Highlight>,
+    >,
 ) {
-    let Ok((mut transform, mut visibility, mut hop)) = query.get_single_mut() else {
+    let Ok((mut transform, mut visibility, material)) = query.get_single_mut() else {
         return;
     };
 
     let Some(hex) = hovered.0 else {
         *visibility = Visibility::Hidden;
-        *prev_hex = None;
-        hop.duration = 0.0;
+        transform.scale = Vec3::ONE;
+        if let Some(mat) = materials.get_mut(&material.0) {
+            mat.color = GOLD;
+        }
         return;
     };
 
     let (tx, ty) = axial_to_pixel(hex.q, hex.r, HEX_SIZE);
     let target = Vec2::new(tx, ty);
+    let dt = time.delta_secs();
 
     if *visibility == Visibility::Hidden {
         transform.translation = Vec3::new(target.x, target.y, 5.0);
+        transform.scale = Vec3::ONE;
         *visibility = Visibility::Visible;
-        *prev_hex = Some(hex);
-        hop.duration = 0.0;
-        return;
-    }
-
-    let hex_changed = prev_hex.map(|h| h != hex).unwrap_or(true);
-    if hex_changed {
-        let steps = prev_hex.map(|h| h.distance(&hex)).unwrap_or(0);
-        let from = transform.translation.truncate();
-        start_highlight_hop(&mut hop, from, target, steps);
-        *prev_hex = Some(hex);
-
-        if hop.duration <= 0.0 {
-            transform.translation = Vec3::new(target.x, target.y, 5.0);
-            *visibility = Visibility::Visible;
-            return;
-        }
-    } else if hop.duration <= 0.0 {
-        transform.translation = Vec3::new(target.x, target.y, 5.0);
-        *visibility = Visibility::Visible;
-        return;
-    }
-
-    hop.elapsed += time.delta_secs();
-    if hop.elapsed >= hop.duration {
-        transform.translation = Vec3::new(hop.to.x, hop.to.y, 5.0);
-        hop.duration = 0.0;
     } else {
-        let t = ease_out_cubic(hop.elapsed / hop.duration);
-        let pos = hop.from.lerp(hop.to, t);
+        let current = transform.translation.truncate();
+        let pos = smooth_follow_vec2_distance_speed(
+            current,
+            target,
+            dt,
+            HOVER_GLOW_SPEED_NEAR,
+            HOVER_GLOW_SPEED_FAR,
+            HEX_SIZE * 0.35,
+            HEX_SIZE * 2.8,
+        );
         transform.translation = Vec3::new(pos.x, pos.y, 5.0);
     }
+
+    let pulse = (time.elapsed_secs() * std::f32::consts::TAU * HOVER_GLOW_PULSE_HZ).sin();
+    transform.scale = Vec3::splat(1.0 + pulse * HOVER_GLOW_PULSE_SCALE);
+    if let Some(mat) = materials.get_mut(&material.0) {
+        let alpha = HOVER_GLOW_ALPHA_BASE + pulse * HOVER_GLOW_ALPHA_AMP;
+        mat.color = GOLD.with_alpha(alpha);
+    }
     *visibility = Visibility::Visible;
+}
+
+// ── Hunting lodge placement ───────────────────────────────────────
+
+fn handle_hunting_lodge_button(
+    mut interaction: Query<&Interaction, (Changed<Interaction>, With<HuntingLodgeButton>)>,
+    mut mode: ResMut<BuildingPlacementMode>,
+) {
+    for interaction in &mut interaction {
+        if *interaction != Interaction::Pressed {
+            continue;
+        }
+        *mode = match *mode {
+            BuildingPlacementMode::Idle => BuildingPlacementMode::PlacingHuntingLodge,
+            BuildingPlacementMode::PlacingHuntingLodge => BuildingPlacementMode::Idle,
+        };
+    }
+}
+
+fn sync_hunting_lodge_toolbar(
+    mode: Res<BuildingPlacementMode>,
+    mut label: Query<&mut Text, With<HuntingLodgeButtonLabel>>,
+    mut fills: Query<(&mut MenuFadeLayer, &mut BackgroundColor), With<MenuButtonFill>>,
+    children: Query<&Children, With<HuntingLodgeButton>>,
+) {
+    if !mode.is_changed() {
+        return;
+    }
+    let placing = mode.is_placing_lodge();
+    for mut text in &mut label {
+        text.0 = if placing {
+            "Hunting Lodge (placing)".to_string()
+        } else {
+            "Hunting Lodge".to_string()
+        };
+    }
+    let btn_color = if placing { BTN_PRESSED } else { BTN_IDLE };
+    if let Ok(kids) = children.get_single() {
+        for child in kids.iter() {
+            if let Ok((mut layer, mut bg)) = fills.get_mut(*child) {
+                layer.base = btn_color;
+                bg.0 = btn_color;
+            }
+        }
+    }
+}
+
+fn cancel_lodge_placement_on_escape(
+    keys: Res<ButtonInput<KeyCode>>,
+    screen: Res<MenuScreen>,
+    mut mode: ResMut<BuildingPlacementMode>,
+) {
+    if *screen != MenuScreen::Closed || !keys.just_pressed(KeyCode::Escape) {
+        return;
+    }
+    if !mode.is_placing_lodge() {
+        return;
+    }
+    *mode = BuildingPlacementMode::Idle;
+}
+
+fn update_lodge_placement_ghost(
+    mode: Res<BuildingPlacementMode>,
+    hovered: Res<HoveredHex>,
+    map: Res<GameMap>,
+    placed: Res<PlacedLodges>,
+    mut ghosts: Query<(
+        &LodgeGhost,
+        &mut Transform,
+        &mut Visibility,
+        &MeshMaterial2d<ColorMaterial>,
+    )>,
+    mut materials: ResMut<Assets<ColorMaterial>>,
+) {
+    if !mode.is_placing_lodge() {
+        for (_, _, mut vis, _) in &mut ghosts {
+            *vis = Visibility::Hidden;
+        }
+        return;
+    }
+    let Some(anchor) = hovered.0 else {
+        for (_, _, mut vis, _) in &mut ghosts {
+            *vis = Visibility::Hidden;
+        }
+        return;
+    };
+    let valid = can_place_lodge(&map.0, &placed.occupied, anchor);
+    let ghost_color = if valid {
+        LODGE_GHOST_VALID
+    } else {
+        LODGE_GHOST_INVALID
+    };
+    let coords = lodge_coords(anchor);
+    for (ghost, mut transform, mut visibility, material) in &mut ghosts {
+        let idx = ghost.slot as usize;
+        if idx >= coords.len() {
+            *visibility = Visibility::Hidden;
+            continue;
+        }
+        let (tx, ty) = axial_to_pixel(coords[idx].q, coords[idx].r, HEX_SIZE);
+        transform.translation = Vec3::new(tx, ty, 5.0);
+        *visibility = Visibility::Visible;
+        if let Some(mat) = materials.get_mut(&material.0) {
+            mat.color = ghost_color;
+        }
+    }
+}
+
+fn handle_lodge_placement_click(
+    mouse: Res<ButtonInput<MouseButton>>,
+    mode: Res<BuildingPlacementMode>,
+    hovered: Res<HoveredHex>,
+    map: Res<GameMap>,
+    mut placed: ResMut<PlacedLodges>,
+    mut commands: Commands,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<ColorMaterial>>,
+) {
+    if !mode.is_placing_lodge() || !mouse.just_pressed(MouseButton::Left) {
+        return;
+    }
+    let Some(anchor) = hovered.0 else {
+        return;
+    };
+    if !can_place_lodge(&map.0, &placed.occupied, anchor) {
+        return;
+    }
+    spawn_lodge_tiles(&mut commands, &mut meshes, &mut materials, anchor);
+    for coord in lodge_coords(anchor) {
+        placed.occupied.insert(coord);
+    }
+    placed.anchors.push(anchor);
+}
+
+fn spawn_lodge_tiles(
+    commands: &mut Commands,
+    meshes: &mut ResMut<Assets<Mesh>>,
+    materials: &mut ResMut<Assets<ColorMaterial>>,
+    anchor: HexCoord,
+) {
+    let mesh = meshes.add(make_hex_fill_mesh(HEX_SIZE * 0.92));
+    let mat = materials.add(ColorMaterial::from_color(LODGE_TILE_BROWN));
+    for coord in lodge_coords(anchor) {
+        let (tx, ty) = axial_to_pixel(coord.q, coord.r, HEX_SIZE);
+        commands.spawn((
+            Mesh2d(mesh.clone()),
+            MeshMaterial2d(mat.clone()),
+            Transform::from_xyz(tx, ty, 1.0),
+            LodgeTile,
+            WorldEntity,
+        ));
+    }
 }
 
 // ── Tile selection (right-click) ────────────────────────────────
@@ -1334,10 +1954,10 @@ fn reset_pause_menu_for_session(
     mut epoch: ResMut<MenuScreenEpoch>,
     mut screen: ResMut<MenuScreen>,
     mut motion: ResMut<MenuMotion>,
-    mut menu_root: Query<
+    mut menu_layers: Query<
         (&mut Node, &mut Visibility),
         (
-            With<MenuRoot>,
+            With<PauseMenuLayer>,
             Without<PauseHomePanel>,
             Without<SettingsMenuPanel>,
         ),
@@ -1360,20 +1980,19 @@ fn reset_pause_menu_for_session(
     >,
     mut main_xform: Query<&mut Transform, (With<PauseHomePanel>, Without<SettingsMenuPanel>)>,
     mut settings_xform: Query<&mut Transform, (With<SettingsMenuPanel>, Without<PauseHomePanel>)>,
-    mut overlay_xform: Query<
-        &mut Transform,
-        (
-            With<MenuRoot>,
-            Without<PauseHomePanel>,
-            Without<SettingsMenuPanel>,
-        ),
+    mut fade_layers: Query<
+        (&MenuFadeLayer, &mut BackgroundColor),
+        (Without<Text>, With<MenuFadeLayer>),
     >,
-    mut fade_layers: Query<(&MenuFadeLayer, &mut BackgroundColor)>,
+    mut fade_text: Query<
+        (&MenuFadeLayer, &mut TextColor, &mut BackgroundColor),
+        With<Text>,
+    >,
 ) {
     epoch.0 += 1;
     *screen = MenuScreen::Closed;
     *motion = MenuMotion::default();
-    if let Ok((mut node, mut vis)) = menu_root.get_single_mut() {
+    for (mut node, mut vis) in &mut menu_layers {
         node.display = Display::None;
         *vis = Visibility::Hidden;
     }
@@ -1389,10 +2008,7 @@ fn reset_pause_menu_for_session(
     if let Ok(mut xform) = settings_xform.get_single_mut() {
         *xform = Transform::default();
     }
-    if let Ok(mut xform) = overlay_xform.get_single_mut() {
-        *xform = Transform::default();
-    }
-    apply_menu_fade_alpha(0.0, &mut fade_layers);
+    apply_menu_fade_alpha(0.0, &mut fade_layers, &mut fade_text);
 }
 
 fn spawn_pause_menu(mut commands: Commands, theme: Res<UiTheme>) {
@@ -1409,12 +2025,10 @@ fn spawn_pause_menu(mut commands: Commands, theme: Res<UiTheme>) {
                 align_items: AlignItems::Center,
                 ..default()
             },
-            BackgroundColor(MENU_BACKDROP),
-            MenuFadeLayer {
-                base: MENU_BACKDROP,
-            },
             Visibility::Hidden,
+            GlobalZIndex(GLOBAL_Z_MENU_PANEL),
             MenuRoot,
+            PauseMenuLayer,
         ))
         .with_children(|overlay| {
             overlay
@@ -1430,8 +2044,11 @@ fn spawn_pause_menu(mut commands: Commands, theme: Res<UiTheme>) {
                         frame
                             .spawn(menu_panel_bundle_with_fade(320.0))
                             .with_children(|panel| {
-                            panel.spawn(theme.value("PAUSED", 26.0));
-                            spawn_ornate_divider(panel, theme);
+                            panel.spawn((
+                                theme.value("PAUSED", 26.0),
+                                MenuFadeLayer { base: CREAM },
+                            ));
+                            spawn_ornate_divider(panel, theme, true);
                             panel
                                 .spawn((
                                     menu_button_row_bundle(),
@@ -1459,7 +2076,10 @@ fn spawn_pause_menu(mut commands: Commands, theme: Res<UiTheme>) {
                                 .with_children(|btn| {
                                     spawn_menu_button_label(btn, theme, "Main Menu", ());
                                 });
-                            panel.spawn(theme.hint("ESC — Close menu", 12.0));
+                            panel.spawn((
+                                theme.hint("ESC — Close menu", 12.0),
+                                MenuFadeLayer { base: HINT },
+                            ));
                         });
                     });
                 });
@@ -1477,8 +2097,11 @@ fn spawn_pause_menu(mut commands: Commands, theme: Res<UiTheme>) {
                         frame
                             .spawn(menu_panel_bundle_with_fade(320.0))
                             .with_children(|panel| {
-                            panel.spawn(theme.value("SETTINGS", 26.0));
-                            spawn_ornate_divider(panel, theme);
+                            panel.spawn((
+                                theme.value("SETTINGS", 26.0),
+                                MenuFadeLayer { base: CREAM },
+                            ));
+                            spawn_ornate_divider(panel, theme, true);
                             panel
                                 .spawn((
                                     menu_button_row_bundle(),
@@ -1488,11 +2111,58 @@ fn spawn_pause_menu(mut commands: Commands, theme: Res<UiTheme>) {
                                 .with_children(|btn| {
                                     spawn_menu_button_label(btn, theme, "Grid: OFF", GridToggleLabel);
                                 });
-                            panel.spawn(theme.hint("ESC — Back", 12.0));
+                            panel.spawn((
+                                theme.hint("ESC — Back", 12.0),
+                                MenuFadeLayer { base: HINT },
+                            ));
                         });
                     });
                 });
         });
+}
+
+fn sync_pause_world_dim(
+    screen: Res<MenuScreen>,
+    motion: Res<MenuMotion>,
+    dim_mat: Option<Res<PauseDimMaterial>>,
+    mut materials: ResMut<Assets<ColorMaterial>>,
+    mut world_dim: Query<&mut Visibility, With<PauseWorldDim>>,
+) {
+    let show = *screen != MenuScreen::Closed || motion.phase == MenuMotionPhase::Exit;
+    for mut vis in &mut world_dim {
+        *vis = if show {
+            Visibility::Visible
+        } else {
+            Visibility::Hidden
+        };
+    }
+    if !show {
+        if let Some(dim_mat) = dim_mat.as_ref() {
+            apply_pause_world_dim_alpha(0.0, &mut materials, &dim_mat.0);
+        }
+    }
+}
+
+fn sync_open_pause_menu_fade(
+    screen: Res<MenuScreen>,
+    motion: Res<MenuMotion>,
+    dim_mat: Option<Res<PauseDimMaterial>>,
+    mut materials: ResMut<Assets<ColorMaterial>>,
+    mut fade_layers: Query<
+        (&MenuFadeLayer, &mut BackgroundColor),
+        (Without<Text>, With<MenuFadeLayer>),
+    >,
+    mut fade_text: Query<
+        (&MenuFadeLayer, &mut TextColor, &mut BackgroundColor),
+        With<Text>,
+    >,
+) {
+    if motion.phase == MenuMotionPhase::Idle && *screen != MenuScreen::Closed {
+        apply_menu_fade_alpha(1.0, &mut fade_layers, &mut fade_text);
+        if let Some(dim_mat) = dim_mat.as_ref() {
+            apply_pause_world_dim_alpha(1.0, &mut materials, &dim_mat.0);
+        }
+    }
 }
 
 fn on_menu_screen_changed(
@@ -1503,7 +2173,11 @@ fn on_menu_screen_changed(
     mut last: Local<MenuScreen>,
     mut overlay: Query<
         (&mut Node, &mut Visibility),
-        (With<MenuRoot>, Without<PauseHomePanel>, Without<SettingsMenuPanel>),
+        (
+            With<PauseMenuLayer>,
+            Without<PauseHomePanel>,
+            Without<SettingsMenuPanel>,
+        ),
     >,
     mut main: Query<&mut Node, (With<PauseHomePanel>, Without<MenuRoot>, Without<SettingsMenuPanel>)>,
     mut settings: Query<
@@ -1518,15 +2192,16 @@ fn on_menu_screen_changed(
         &mut Transform,
         (With<SettingsMenuPanel>, Without<MenuRoot>, Without<PauseHomePanel>),
     >,
-    mut overlay_xform: Query<
-        &mut Transform,
-        (
-            With<MenuRoot>,
-            Without<PauseHomePanel>,
-            Without<SettingsMenuPanel>,
-        ),
+    mut fade_layers: Query<
+        (&MenuFadeLayer, &mut BackgroundColor),
+        (Without<Text>, With<MenuFadeLayer>),
     >,
-    mut fade_layers: Query<(&MenuFadeLayer, &mut BackgroundColor)>,
+    mut fade_text: Query<
+        (&MenuFadeLayer, &mut TextColor, &mut BackgroundColor),
+        With<Text>,
+    >,
+    dim_mat: Option<Res<PauseDimMaterial>>,
+    mut materials: ResMut<Assets<ColorMaterial>>,
 ) {
     if *last_epoch != epoch.0 {
         *last_epoch = epoch.0;
@@ -1563,8 +2238,8 @@ fn on_menu_screen_changed(
 
     let show_overlay = *screen != MenuScreen::Closed
         || motion.phase == MenuMotionPhase::Exit;
-    if let Ok((mut node, mut vis)) = overlay.get_single_mut() {
-        if show_overlay {
+    if show_overlay {
+        for (mut node, mut vis) in &mut overlay {
             node.display = Display::Flex;
             *vis = Visibility::Visible;
         }
@@ -1591,15 +2266,17 @@ fn on_menu_screen_changed(
     }
 
     if motion.phase == MenuMotionPhase::Enter {
-        apply_menu_fade_alpha(0.0, &mut fade_layers);
-        if let Ok(mut xform) = overlay_xform.get_single_mut() {
+        apply_menu_fade_alpha(0.0, &mut fade_layers, &mut fade_text);
+        if let Some(dim_mat) = dim_mat.as_ref() {
+            apply_pause_world_dim_alpha(0.0, &mut materials, &dim_mat.0);
+        }
+        let panel_xform = if motion.intro_panel == MenuScreen::Main {
+            main_xform.get_single_mut()
+        } else {
+            settings_xform.get_single_mut()
+        };
+        if let Ok(mut xform) = panel_xform {
             *xform = menu_panel_intro_transform(0.0);
-        }
-        if let Ok(mut xform) = main_xform.get_single_mut() {
-            *xform = Transform::default();
-        }
-        if let Ok(mut xform) = settings_xform.get_single_mut() {
-            *xform = Transform::default();
         }
     } else if motion.phase == MenuMotionPhase::Switch {
         let xform = if motion.intro_panel == MenuScreen::Main {
@@ -1610,19 +2287,18 @@ fn on_menu_screen_changed(
         if let Ok(mut xform) = xform {
             *xform = menu_panel_intro_transform(0.0);
         }
-        if let Ok(mut xform) = overlay_xform.get_single_mut() {
-            *xform = Transform::default();
-        }
     } else if motion.phase == MenuMotionPhase::Exit {
-        apply_menu_fade_alpha(1.0, &mut fade_layers);
-        if let Ok(mut xform) = overlay_xform.get_single_mut() {
+        apply_menu_fade_alpha(1.0, &mut fade_layers, &mut fade_text);
+        if let Some(dim_mat) = dim_mat.as_ref() {
+            apply_pause_world_dim_alpha(1.0, &mut materials, &dim_mat.0);
+        }
+        let panel_xform = if motion.exit_panel == MenuScreen::Main {
+            main_xform.get_single_mut()
+        } else {
+            settings_xform.get_single_mut()
+        };
+        if let Ok(mut xform) = panel_xform {
             *xform = menu_panel_outro_transform(0.0);
-        }
-        if let Ok(mut xform) = main_xform.get_single_mut() {
-            *xform = Transform::default();
-        }
-        if let Ok(mut xform) = settings_xform.get_single_mut() {
-            *xform = Transform::default();
         }
     }
 }
@@ -1630,9 +2306,15 @@ fn on_menu_screen_changed(
 fn update_menu_motion(
     time: Res<Time>,
     mut motion: ResMut<MenuMotion>,
+    dim_mat: Option<Res<PauseDimMaterial>>,
+    mut materials: ResMut<Assets<ColorMaterial>>,
     mut overlay: Query<
         (&mut Node, &mut Visibility),
-        (With<MenuRoot>, Without<PauseHomePanel>, Without<SettingsMenuPanel>),
+        (
+            With<PauseMenuLayer>,
+            Without<PauseHomePanel>,
+            Without<SettingsMenuPanel>,
+        ),
     >,
     mut main: Query<&mut Node, (With<PauseHomePanel>, Without<MenuRoot>, Without<SettingsMenuPanel>)>,
     mut settings: Query<
@@ -1647,15 +2329,14 @@ fn update_menu_motion(
         &mut Transform,
         (With<SettingsMenuPanel>, Without<MenuRoot>, Without<PauseHomePanel>),
     >,
-    mut overlay_xform: Query<
-        &mut Transform,
-        (
-            With<MenuRoot>,
-            Without<PauseHomePanel>,
-            Without<SettingsMenuPanel>,
-        ),
+    mut fade_layers: Query<
+        (&MenuFadeLayer, &mut BackgroundColor),
+        (Without<Text>, With<MenuFadeLayer>),
     >,
-    mut fade_layers: Query<(&MenuFadeLayer, &mut BackgroundColor)>,
+    mut fade_text: Query<
+        (&MenuFadeLayer, &mut TextColor, &mut BackgroundColor),
+        With<Text>,
+    >,
 ) {
     if motion.phase == MenuMotionPhase::Idle {
         return;
@@ -1673,15 +2354,17 @@ fn update_menu_motion(
     match motion.phase {
         MenuMotionPhase::Enter => {
             let fade = ease_out_cubic(raw_t);
-            apply_menu_fade_alpha(fade, &mut fade_layers);
-            if let Ok(mut xform) = overlay_xform.get_single_mut() {
+            apply_menu_fade_alpha(fade, &mut fade_layers, &mut fade_text);
+            if let Some(dim_mat) = dim_mat.as_ref() {
+                apply_pause_world_dim_alpha(fade, &mut materials, &dim_mat.0);
+            }
+            let panel_xform = if motion.intro_panel == MenuScreen::Main {
+                main_xform.get_single_mut()
+            } else {
+                settings_xform.get_single_mut()
+            };
+            if let Ok(mut xform) = panel_xform {
                 *xform = menu_panel_intro_transform(raw_t);
-            }
-            if let Ok(mut xform) = main_xform.get_single_mut() {
-                *xform = Transform::default();
-            }
-            if let Ok(mut xform) = settings_xform.get_single_mut() {
-                *xform = Transform::default();
             }
         }
         MenuMotionPhase::Switch => {
@@ -1693,21 +2376,20 @@ fn update_menu_motion(
             if let Ok(mut xform) = xform {
                 *xform = menu_panel_intro_transform(raw_t);
             }
-            if let Ok(mut xform) = overlay_xform.get_single_mut() {
-                *xform = Transform::default();
-            }
         }
         MenuMotionPhase::Exit => {
             let fade = ease_out_cubic(1.0 - raw_t);
-            apply_menu_fade_alpha(fade, &mut fade_layers);
-            if let Ok(mut xform) = overlay_xform.get_single_mut() {
+            apply_menu_fade_alpha(fade, &mut fade_layers, &mut fade_text);
+            if let Some(dim_mat) = dim_mat.as_ref() {
+                apply_pause_world_dim_alpha(fade, &mut materials, &dim_mat.0);
+            }
+            let panel_xform = if motion.exit_panel == MenuScreen::Main {
+                main_xform.get_single_mut()
+            } else {
+                settings_xform.get_single_mut()
+            };
+            if let Ok(mut xform) = panel_xform {
                 *xform = menu_panel_outro_transform(raw_t);
-            }
-            if let Ok(mut xform) = main_xform.get_single_mut() {
-                *xform = Transform::default();
-            }
-            if let Ok(mut xform) = settings_xform.get_single_mut() {
-                *xform = Transform::default();
             }
         }
         MenuMotionPhase::Teardown | MenuMotionPhase::Idle => {}
@@ -1719,25 +2401,25 @@ fn update_menu_motion(
 
     match motion.phase {
         MenuMotionPhase::Enter | MenuMotionPhase::Switch => {
-            if let Ok(mut xform) = overlay_xform.get_single_mut() {
-                *xform = Transform::default();
-            }
             if let Ok(mut xform) = main_xform.get_single_mut() {
                 *xform = Transform::default();
             }
             if let Ok(mut xform) = settings_xform.get_single_mut() {
                 *xform = Transform::default();
             }
-            apply_menu_fade_alpha(1.0, &mut fade_layers);
+            apply_menu_fade_alpha(1.0, &mut fade_layers, &mut fade_text);
+            if let Some(dim_mat) = dim_mat.as_ref() {
+                apply_pause_world_dim_alpha(1.0, &mut materials, &dim_mat.0);
+            }
         }
         MenuMotionPhase::Exit => {
-            apply_menu_fade_alpha(0.0, &mut fade_layers);
+            apply_menu_fade_alpha(0.0, &mut fade_layers, &mut fade_text);
+            if let Some(dim_mat) = dim_mat.as_ref() {
+                apply_pause_world_dim_alpha(0.0, &mut materials, &dim_mat.0);
+            }
             if let Ok((mut node, mut vis)) = overlay.get_single_mut() {
                 node.display = Display::Flex;
                 *vis = Visibility::Hidden;
-            }
-            if let Ok(mut xform) = overlay_xform.get_single_mut() {
-                *xform = Transform::default();
             }
             if let Ok(mut xform) = main_xform.get_single_mut() {
                 *xform = Transform::default();
@@ -1799,7 +2481,7 @@ fn handle_menu_escape(
 
 fn style_menu_buttons(
     mut buttons: Query<(&Interaction, &Children), (Changed<Interaction>, With<MenuButton>)>,
-    mut fills: Query<&mut BackgroundColor, With<MenuButtonFill>>,
+    mut fills: Query<(&mut MenuFadeLayer, &mut BackgroundColor), With<MenuButtonFill>>,
 ) {
     for (interaction, children) in &mut buttons {
         let color = match *interaction {
@@ -1808,7 +2490,8 @@ fn style_menu_buttons(
             Interaction::None => BTN_IDLE,
         };
         for child in children.iter() {
-            if let Ok(mut bg) = fills.get_mut(*child) {
+            if let Ok((mut layer, mut bg)) = fills.get_mut(*child) {
+                layer.base = color;
                 bg.0 = color;
             }
         }
@@ -2020,32 +2703,19 @@ fn terrain_label(t: TerrainType) -> &'static str {
         TerrainType::BlightedWaste => "Blighted Waste",
         TerrainType::RuinField => "Ruin Field",
         TerrainType::SacredGround => "Sacred Ground",
-        TerrainType::Cinderfield => "Cinderfield",
-        TerrainType::Rootfield => "Rootfield",
-        TerrainType::Duskwood => "Duskwood",
-        TerrainType::Frostpine => "Frostpine",
-        TerrainType::Ashgrove => "Ashgrove",
     }
 }
 
 fn terrain_category(t: TerrainType) -> Option<&'static str> {
     match t {
-        TerrainType::Plains
-        | TerrainType::Greenfield
-        | TerrainType::Cinderfield
-        | TerrainType::Rootfield => Some("Base"),
+        TerrainType::Plains | TerrainType::Greenfield => Some("Base"),
         TerrainType::DeepOcean
         | TerrainType::Ocean
         | TerrainType::Coast
         | TerrainType::Freshwater => Some("Water"),
         TerrainType::SnowPeak | TerrainType::StonySlope => Some("Mountain"),
         TerrainType::Beach => Some("Shore"),
-        TerrainType::Oldwood
-        | TerrainType::Darkpine
-        | TerrainType::Deepjungle
-        | TerrainType::Duskwood
-        | TerrainType::Frostpine
-        | TerrainType::Ashgrove => Some("Forest"),
+        TerrainType::Oldwood | TerrainType::Darkpine | TerrainType::Deepjungle => Some("Forest"),
         _ => None,
     }
 }
@@ -2083,6 +2753,8 @@ fn reroll_world(
     world_entities: Query<Entity, With<WorldEntity>>,
     mut selected: ResMut<SelectedHex>,
     mut hovered: ResMut<HoveredHex>,
+    mut placement_mode: ResMut<BuildingPlacementMode>,
+    mut placed_lodges: ResMut<PlacedLodges>,
 ) {
     if !keys.just_pressed(KeyCode::KeyR) {
         return;
@@ -2091,6 +2763,9 @@ fn reroll_world(
     for e in &world_entities {
         commands.entity(e).despawn_recursive();
     }
+
+    *placement_mode = BuildingPlacementMode::Idle;
+    *placed_lodges = PlacedLodges::default();
 
     let seed = rand::thread_rng().gen::<u64>();
     seed_res.0 = seed;

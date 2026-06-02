@@ -62,7 +62,7 @@ pub fn spawn_loading_screen(
             menu_framed_overlay(overlay, &theme, false, |frame, theme| {
                 frame.spawn(menu_panel_bundle(360.0)).with_children(|panel| {
                     panel.spawn(theme.value("MYARI", 28.0));
-                    spawn_ornate_divider(panel, theme);
+                    spawn_ornate_divider(panel, theme, false);
                     panel.spawn((theme.value("Preparing…", 18.0), LoadingStatusText));
                     spawn_loading_bar(panel, &mut images);
                 });

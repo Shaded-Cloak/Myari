@@ -78,11 +78,6 @@ pub enum TerrainType {
     BlightedWaste,
     RuinField,
     SacredGround,
-    Cinderfield,
-    Rootfield,
-    Duskwood,
-    Frostpine,
-    Ashgrove,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -461,7 +456,7 @@ fn fix_inland_holes(gen: &mut [TileGen], by_coord: &TileIndex) {
 
 // ── Inland lakes ─────────────────────────────────────────────────────────────
 
-/// Drop Freshwater lakes on each crescent. Runs BEFORE
+/// Drop Freshwater lakes on each land island (center + crescents). Runs BEFORE
 /// `assign_beaches` so the beach pass naturally wraps every lake with sand.
 ///
 /// Algorithm: per island, sample a high-frequency FBM seeded uniquely for
@@ -471,7 +466,8 @@ fn fix_inland_holes(gen: &mut [TileGen], by_coord: &TileIndex) {
 /// noise distribution shifts. A final pass drops any 1-tile lake (isolated
 /// Freshwater with no Freshwater neighbour) back to Plains.
 fn assign_lakes(gen: &mut [TileGen], seed: u64, by_coord: &TileIndex) {
-    let lake_islands: [(Island, u8); 3] = [
+    let lake_islands: [(Island, u8); 4] = [
+        (Island::Center, crate::outer_islands::CENTER_ISLAND_ID),
         (Island::Crescent(0), 0),
         (Island::Crescent(1), 1),
         (Island::Crescent(2), 2),
@@ -543,7 +539,7 @@ fn assign_lakes(gen: &mut [TileGen], seed: u64, by_coord: &TileIndex) {
 
 // ── Beach fringe ─────────────────────────────────────────────────────────────
 
-fn is_water(t: TerrainType) -> bool {
+pub fn is_water(t: TerrainType) -> bool {
     matches!(
         t,
         TerrainType::DeepOcean
@@ -706,23 +702,29 @@ fn inland_distances(land: &[HexCoord]) -> FxHashMap<HexCoord, i32> {
     dist
 }
 
-// ── Procedural island terrain (crescents via outer_islands; center separate) ─
+// ── Procedural island terrain (center + crescents) ───────────────────────────
 
 fn collect_classified_islands(
     gen: &[TileGen],
 ) -> Vec<(u8, Vec<HexCoord>, FxHashMap<HexCoord, i32>)> {
-    let mut out: Vec<(u8, Vec<HexCoord>, FxHashMap<HexCoord, i32>)> = Vec::with_capacity(3);
+    let mut out: Vec<(u8, Vec<HexCoord>, FxHashMap<HexCoord, i32>)> = Vec::with_capacity(4);
 
     // Freshwater is excluded so forest/mountain budgets ignore lake tiles.
+    let mut center: Vec<HexCoord> = Vec::new();
     let mut buckets: [Vec<HexCoord>; 3] = Default::default();
     for t in gen {
         if t.terrain == TerrainType::Freshwater {
             continue;
         }
         match t.island {
+            Some(Island::Center) => center.push(t.coord),
             Some(Island::Crescent(i)) => buckets[i as usize].push(t.coord),
-            _ => {}
+            None => {}
         }
+    }
+    if !center.is_empty() {
+        let inland = inland_distances(&center);
+        out.push((crate::outer_islands::CENTER_ISLAND_ID, center, inland));
     }
     for (i, land) in buckets.into_iter().enumerate() {
         if land.is_empty() {
@@ -734,24 +736,9 @@ fn collect_classified_islands(
     out
 }
 
-fn center_land_coords(gen: &[TileGen]) -> Vec<HexCoord> {
-    gen.iter()
-        .filter(|t| {
-            t.island == Some(Island::Center)
-                && t.terrain != TerrainType::Freshwater
-        })
-        .map(|t| t.coord)
-        .collect()
-}
-
 fn assign_island_terrain(gen: &mut [TileGen], seed: u64, by_coord: &TileIndex) {
-    let crescent_islands = collect_classified_islands(gen);
-    let mut assignments = crate::outer_islands::classify_all(seed, &crescent_islands);
-
-    let center_land = center_land_coords(gen);
-    if !center_land.is_empty() {
-        assignments.extend(crate::center_island::classify(seed, &center_land));
-    }
+    let islands = collect_classified_islands(gen);
+    let assignments = crate::outer_islands::classify_all(seed, &islands);
 
     for (coord, terrain) in assignments {
         if let Some(idx) = by_coord.get(coord) {
@@ -843,15 +830,6 @@ fn speckle_cleanup(gen: &mut [TileGen], by_coord: &TileIndex) {
         ) {
             continue;
         }
-        // Center magic forests are patch-unified in center_island; speckle would
-        // erase their ragged edges back to Cinderfield/Rootfield.
-        if matches!(
-            tile.terrain,
-            TerrainType::Duskwood | TerrainType::Frostpine | TerrainType::Ashgrove
-        ) {
-            continue;
-        }
-
         let mut same = 0;
         let mut land_neighbors = 0;
         counts.clear();
@@ -925,11 +903,6 @@ fn terrain_name(t: TerrainType) -> &'static str {
         TerrainType::BlightedWaste => "BlightedWaste",
         TerrainType::RuinField => "RuinField",
         TerrainType::SacredGround => "SacredGround",
-        TerrainType::Cinderfield => "Cinderfield",
-        TerrainType::Rootfield => "Rootfield",
-        TerrainType::Duskwood => "Duskwood",
-        TerrainType::Frostpine => "Frostpine",
-        TerrainType::Ashgrove => "Ashgrove",
     }
 }
 
@@ -957,11 +930,6 @@ fn log_distribution(tiles: &[HexTile]) {
         TerrainType::StonySlope,
         TerrainType::SnowPeak,
         TerrainType::AridPeak,
-        TerrainType::Cinderfield,
-        TerrainType::Rootfield,
-        TerrainType::Duskwood,
-        TerrainType::Frostpine,
-        TerrainType::Ashgrove,
     ];
 
     println!("=== Terrain Distribution ===");
@@ -988,7 +956,7 @@ mod tests {
     // never emits them. Freshwater is the new inland-lake tile; it appears on
     // outer islands at the centre of lakes, surrounded by Beach.
     // must not emit them on outer islands until they are re-enabled.
-    const ALLOWED_CRESCENT_LAND: &[TerrainType] = &[
+    const ALLOWED_OUTER_LAND: &[TerrainType] = &[
         TerrainType::Beach,
         TerrainType::Freshwater,
         TerrainType::Plains,
@@ -999,22 +967,6 @@ mod tests {
         TerrainType::StonySlope,
         TerrainType::SnowPeak,
     ];
-
-    const ALLOWED_CENTER_LAND: &[TerrainType] = &[
-        TerrainType::Beach,
-        TerrainType::Cinderfield,
-        TerrainType::Rootfield,
-        TerrainType::Duskwood,
-        TerrainType::Frostpine,
-        TerrainType::Ashgrove,
-    ];
-
-    fn is_center_forest(t: TerrainType) -> bool {
-        matches!(
-            t,
-            TerrainType::Duskwood | TerrainType::Frostpine | TerrainType::Ashgrove
-        )
-    }
 
     fn is_outer_forest(t: TerrainType) -> bool {
         matches!(
@@ -1066,7 +1018,7 @@ mod tests {
             for &coord in land {
                 let t = terrains[&coord];
                 assert!(
-                    ALLOWED_CRESCENT_LAND.contains(&t),
+                    ALLOWED_OUTER_LAND.contains(&t),
                     "crescent {i} tile {:?} has unallowed terrain {:?}",
                     coord,
                     t
@@ -1076,7 +1028,7 @@ mod tests {
         for &coord in &center_land(&map, 42) {
             let t = terrains[&coord];
             assert!(
-                ALLOWED_CENTER_LAND.contains(&t),
+                ALLOWED_OUTER_LAND.contains(&t),
                 "center tile {:?} has unallowed terrain {:?}",
                 coord,
                 t
@@ -1226,8 +1178,13 @@ mod tests {
             let mut map_wide_forests: std::collections::HashSet<TerrainType> =
                 std::collections::HashSet::new();
 
-            for (i, land) in by_island.iter().enumerate() {
-                let label = format!("crescent {i}");
+            let islands: [(&str, Vec<HexCoord>); 4] = [
+                ("crescent 0", by_island[0].clone()),
+                ("crescent 1", by_island[1].clone()),
+                ("crescent 2", by_island[2].clone()),
+                ("center", center_land(&map, seed)),
+            ];
+            for (label, land) in islands {
                 let present: std::collections::HashSet<TerrainType> = land
                     .iter()
                     .filter_map(|c| terrains.get(c).copied())
@@ -1254,38 +1211,6 @@ mod tests {
                     }
                 }
             }
-
-            let center = center_land(&map, seed);
-            let center_present: std::collections::HashSet<TerrainType> = center
-                .iter()
-                .filter_map(|c| terrains.get(c).copied())
-                .collect();
-            for t in [
-                TerrainType::Cinderfield,
-                TerrainType::Rootfield,
-                TerrainType::Duskwood,
-                TerrainType::Frostpine,
-                TerrainType::Ashgrove,
-            ] {
-                assert!(
-                    center_present.contains(&t),
-                    "seed {seed} center missing terrain {:?}",
-                    t
-                );
-            }
-            let forest_frac = center
-                .iter()
-                .filter(|c| terrains.get(c).is_some_and(|t| is_center_forest(*t)))
-                .count() as f32
-                / center.len().max(1) as f32;
-            assert!(
-                (0.18..=0.28).contains(&forest_frac),
-                "seed {seed} center forest fraction {forest_frac} outside ~20–25 %"
-            );
-            assert!(
-                !center_present.contains(&TerrainType::Freshwater),
-                "seed {seed} center must not have lakes"
-            );
 
             // Across the three crescents combined, every forest type should
             // show up somewhere so the world isn't missing a flavour entirely.
