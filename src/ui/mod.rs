@@ -2,6 +2,7 @@
 
 use bevy::hierarchy::ChildBuilder;
 use bevy::prelude::*;
+use bevy::ui::FocusPolicy;
 
 use crate::app_state::InGameHud;
 
@@ -24,6 +25,10 @@ pub const HINT: Color = Color::srgba(0.75, 0.62, 0.38, 0.55);
 pub const BTN_IDLE: Color = Color::srgba(0.10, 0.08, 0.06, 0.95);
 pub const BTN_HOVER: Color = Color::srgba(0.16, 0.12, 0.08, 0.98);
 pub const BTN_PRESSED: Color = Color::srgba(0.22, 0.16, 0.10, 1.0);
+
+/// Marks HUD panels that should absorb pointer input from reaching the map.
+#[derive(Component)]
+pub struct BlocksWorldInput;
 
 pub const MENU_ENTER_SECS: f32 = 0.22;
 /// Pause-menu close — fade + shrink together, then done (no post-hide shrink).
@@ -283,6 +288,9 @@ pub fn spawn_framed_panel(
                     },
                     BackgroundColor(PANEL),
                     BorderColor(GOLD_DIM),
+                    BlocksWorldInput,
+                    FocusPolicy::Block,
+                    Interaction::None,
                 ))
                 .with_children(|panel| fill(panel, theme));
         });

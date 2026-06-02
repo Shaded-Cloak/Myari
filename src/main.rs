@@ -18,7 +18,7 @@ use bevy::render::mesh::Indices;
 use bevy::render::render_resource::PrimitiveTopology;
 use bevy::window::{MonitorSelection, PrimaryWindow, WindowMode};
 use bevy::transform::TransformSystem;
-use bevy::ui::UiSystem;
+use bevy::ui::{FocusPolicy, UiSystem};
 use bevy_pancam::{PanCam, PanCamPlugin};
 use rand::Rng;
 use std::collections::{HashMap, HashSet};
@@ -35,7 +35,7 @@ use ui::{
     spawn_ornate_divider, spawn_star_watermark, title_menu::{
         self, spawn_title_menu, sync_title_subscreen, TitleRoot, TitleScreen,
     },
-    apply_menu_fade_alpha, ease_out_cubic, smooth_follow_vec2_distance_speed, HudAnchor,
+    apply_menu_fade_alpha, ease_out_cubic, smooth_follow_vec2_distance_speed, BlocksWorldInput, HudAnchor,
     MenuButton, MenuButtonFill, MenuFadeLayer,
     UiTheme, BTN_HOVER, BTN_IDLE, BTN_PRESSED,
     CREAM, GOLD, HINT, MENU_ENTER_SECS, MENU_EXIT_SECS, MENU_SWITCH_SECS,
@@ -574,6 +574,12 @@ struct HoverEmptyHint;
 struct ExaminerBuildingBlock;
 
 #[derive(Component)]
+struct ExaminerBuildingDivider;
+
+#[derive(Component)]
+struct ExaminerCoordsDivider;
+
+#[derive(Component)]
 struct ExaminerBuildingNameText;
 
 #[derive(Component)]
@@ -1094,10 +1100,15 @@ fn spawn_building_toolbar(commands: &mut Commands, theme: &UiTheme) {
             InGameHud,
         ))
         .with_children(|bar| {
-            bar.spawn(Node {
-                width: Val::Px(220.0),
-                ..default()
-            })
+            bar.spawn((
+                Node {
+                    width: Val::Px(220.0),
+                    ..default()
+                },
+                BlocksWorldInput,
+                FocusPolicy::Block,
+                Interaction::None,
+            ))
             .with_children(|wrap| {
                 wrap.spawn((
                     menu_button_row_bundle(),
@@ -1125,6 +1136,7 @@ fn spawn_game_hud(commands: &mut Commands, theme: &UiTheme, seed: u64) {
         |panel, theme| {
             panel.spawn(theme.label("TURN"));
             panel.spawn((theme.value("1", 22.0), TurnText));
+            panel.spawn(theme.hint("Space — next turn", 11.0));
             spawn_ornate_divider(panel, theme, false);
             panel.spawn(theme.label("SEED"));
             panel.spawn((theme.value(seed.to_string(), 15.0), SeedText));
@@ -1176,7 +1188,19 @@ fn spawn_hover_panel(commands: &mut Commands, theme: &UiTheme, images: &mut Asse
                     block.spawn((theme.value("—", 19.0), HoverCategoryText));
                 });
 
-            spawn_ornate_divider(panel, theme, false);
+            panel
+                .spawn((
+                    Node {
+                        width: Val::Percent(100.0),
+                        display: Display::None,
+                        ..default()
+                    },
+                    Visibility::Hidden,
+                    ExaminerBuildingDivider,
+                ))
+                .with_children(|wrap| {
+                    spawn_ornate_divider(wrap, theme, false);
+                });
 
             panel
                 .spawn((
@@ -1197,7 +1221,14 @@ fn spawn_hover_panel(commands: &mut Commands, theme: &UiTheme, images: &mut Asse
                     block.spawn((theme.value("—", 19.0), ExaminerBuildingFoodText));
                 });
 
-            spawn_ornate_divider(panel, theme, false);
+            panel
+                .spawn((Node {
+                    width: Val::Percent(100.0),
+                    ..default()
+                }, ExaminerCoordsDivider))
+                .with_children(|wrap| {
+                    spawn_ornate_divider(wrap, theme, false);
+                });
 
             panel
                 .spawn((
@@ -1841,7 +1872,11 @@ fn make_grid_mesh(tiles: &[HexTile], size: f32) -> Mesh {
     let edge_key = |a: HexCoord, b: HexCoord| -> ((i32, i32), (i32, i32)) {
         let aa = (a.q, a.r);
         let bb = (b.q, b.r);
-        if aa <= bb { (aa, bb) } else { (bb, aa) }
+        if aa <= bb {
+            (aa, bb)
+        } else {
+            (bb, aa)
+        }
     };
     for tile in tiles {
         let mut corners: [[f32; 3]; 6] = [[0.0; 3]; 6];
@@ -1917,16 +1952,44 @@ fn pointer_over_hunting_lodge_button(
         .any(|i| matches!(*i, Interaction::Hovered | Interaction::Pressed))
 }
 
+fn pointer_over_blocked_ui(blockers: Query<&Interaction, With<BlocksWorldInput>>) -> bool {
+    blockers
+        .iter()
+        .any(|i| matches!(*i, Interaction::Hovered | Interaction::Pressed))
+}
+
+fn pointer_over_ingame_ui(
+    blockers: Query<&Interaction, With<BlocksWorldInput>>,
+    lodge_button: Query<&Interaction, With<HuntingLodgeButton>>,
+) -> bool {
+    pointer_over_blocked_ui(blockers) || pointer_over_hunting_lodge_button(lodge_button)
+}
+
+fn hover_suppressed_for_selected_building(
+    examiner: &ExaminerSelection,
+    placed: &PlacedLodges,
+    hex: HexCoord,
+) -> bool {
+    let Some(ExaminerFocus::Building(idx)) = examiner.0 else {
+        return false;
+    };
+    let Some(lodge) = placed.lodges.get(idx) else {
+        return false;
+    };
+    lodge_coords(lodge.anchor, lodge.rotation).contains(&hex)
+}
+
 fn track_hover(
     mode: Res<BuildingPlacementMode>,
     window: Query<&Window, With<PrimaryWindow>>,
     camera: Query<&Transform, With<Camera2d>>,
     mut hovered: ResMut<HoveredHex>,
     zoom: Res<Zoom>,
+    blockers: Query<&Interaction, With<BlocksWorldInput>>,
     lodge_button: Query<&Interaction, With<HuntingLodgeButton>>,
     mut cursor_evr: EventReader<CursorMoved>,
 ) {
-    if pointer_over_hunting_lodge_button(lodge_button) {
+    if pointer_over_ingame_ui(blockers, lodge_button) {
         // While placing, keep the last map hex so the blueprint stays visible over the button.
         if mode.is_placing_lodge() {
             return;
@@ -1945,6 +2008,8 @@ fn animate_hover_highlight(
     time: Res<Time>,
     mode: Res<BuildingPlacementMode>,
     hovered: Res<HoveredHex>,
+    examiner: Res<ExaminerSelection>,
+    placed: Res<PlacedLodges>,
     mut materials: ResMut<Assets<ColorMaterial>>,
     mut query: Query<
         (&mut Transform, &mut Visibility, &MeshMaterial2d<ColorMaterial>),
@@ -1973,23 +2038,30 @@ fn animate_hover_highlight(
     let (tx, ty) = axial_to_pixel(hex.q, hex.r, HEX_SIZE);
     let target = Vec2::new(tx, ty);
     let dt = time.delta_secs();
+    let suppressed = hover_suppressed_for_selected_building(&examiner, &placed, hex);
 
-    if *visibility == Visibility::Hidden {
-        transform.translation = Vec3::new(target.x, target.y, 5.0);
+    let current = transform.translation.truncate();
+    let pos = smooth_follow_vec2_distance_speed(
+        current,
+        target,
+        dt,
+        HOVER_GLOW_SPEED_NEAR,
+        HOVER_GLOW_SPEED_FAR,
+        HEX_SIZE * 0.35,
+        HEX_SIZE * 2.8,
+    );
+    transform.translation = Vec3::new(pos.x, pos.y, 5.0);
+
+    if suppressed {
+        let arrived = pos.distance_squared(target) < (HEX_SIZE * 0.12).powi(2);
+        if arrived || *visibility == Visibility::Hidden {
+            *visibility = Visibility::Hidden;
+            transform.scale = Vec3::ONE;
+            return;
+        }
+        // Still sliding onto a selected-building tile — keep visible until we arrive.
+    } else if *visibility == Visibility::Hidden {
         transform.scale = Vec3::ONE;
-        *visibility = Visibility::Visible;
-    } else {
-        let current = transform.translation.truncate();
-        let pos = smooth_follow_vec2_distance_speed(
-            current,
-            target,
-            dt,
-            HOVER_GLOW_SPEED_NEAR,
-            HOVER_GLOW_SPEED_FAR,
-            HEX_SIZE * 0.35,
-            HEX_SIZE * 2.8,
-        );
-        transform.translation = Vec3::new(pos.x, pos.y, 5.0);
     }
 
     let pulse = (time.elapsed_secs() * std::f32::consts::TAU * HOVER_GLOW_PULSE_HZ).sin();
@@ -2061,26 +2133,40 @@ fn sync_hunting_lodge_toolbar(
     }
 }
 
+fn cancel_lodge_placement(
+    mode: &mut BuildingPlacementMode,
+    mesh_cache: &mut LodgeBlueprintMeshCache,
+) {
+    *mode = BuildingPlacementMode::Idle;
+    mesh_cache.rotation = None;
+}
+
+fn pause_menu_open(screen: &MenuScreen) -> bool {
+    *screen != MenuScreen::Closed
+}
+
 fn cancel_lodge_placement_on_escape(
     keys: Res<ButtonInput<KeyCode>>,
     screen: Res<MenuScreen>,
     mut mode: ResMut<BuildingPlacementMode>,
+    mut mesh_cache: ResMut<LodgeBlueprintMeshCache>,
 ) {
-    if *screen != MenuScreen::Closed || !keys.just_pressed(KeyCode::Escape) {
+    if pause_menu_open(&screen) || !keys.just_pressed(KeyCode::Escape) {
         return;
     }
     if !mode.is_placing_lodge() {
         return;
     }
-    *mode = BuildingPlacementMode::Idle;
+    cancel_lodge_placement(&mut mode, &mut mesh_cache);
 }
 
 fn handle_lodge_rotate(
     keys: Res<ButtonInput<KeyCode>>,
+    screen: Res<MenuScreen>,
     mode: Res<BuildingPlacementMode>,
     mut rotation: ResMut<LodgePlacementRotation>,
 ) {
-    if !mode.is_placing_lodge() || !keys.just_pressed(KeyCode::KeyR) {
+    if pause_menu_open(&screen) || !mode.is_placing_lodge() || !keys.just_pressed(KeyCode::KeyR) {
         return;
     }
     rotation.0 = (rotation.0 + 1) % 6;
@@ -2188,13 +2274,16 @@ fn animate_lodge_blueprint(
 
 fn handle_lodge_placement_click(
     mouse: Res<ButtonInput<MouseButton>>,
-    mode: Res<BuildingPlacementMode>,
+    screen: Res<MenuScreen>,
     suppress: Res<LodgePlacementSuppressClick>,
+    blockers: Query<&Interaction, With<BlocksWorldInput>>,
     lodge_button: Query<&Interaction, With<HuntingLodgeButton>>,
     hovered: Res<HoveredHex>,
     rotation: Res<LodgePlacementRotation>,
     map: Res<GameMap>,
     mut placed: ResMut<PlacedLodges>,
+    mut mode: ResMut<BuildingPlacementMode>,
+    mut mesh_cache: ResMut<LodgeBlueprintMeshCache>,
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<ColorMaterial>>,
@@ -2202,7 +2291,10 @@ fn handle_lodge_placement_click(
     if !mode.is_placing_lodge() || !mouse.just_pressed(MouseButton::Left) {
         return;
     }
-    if suppress.frames > 0 || pointer_over_hunting_lodge_button(lodge_button) {
+    if pause_menu_open(&screen)
+        || suppress.frames > 0
+        || pointer_over_ingame_ui(blockers, lodge_button)
+    {
         return;
     }
     let Some(center) = hovered.0 else {
@@ -2219,6 +2311,7 @@ fn handle_lodge_placement_click(
         rotation.0,
     );
     placed.register_lodge(center, rotation.0);
+    cancel_lodge_placement(&mut mode, &mut mesh_cache);
 }
 
 fn spawn_lodge_building(
@@ -2271,12 +2364,17 @@ fn animate_lodge_place_pop(
 
 fn handle_selection(
     mouse: Res<ButtonInput<MouseButton>>,
+    blockers: Query<&Interaction, With<BlocksWorldInput>>,
+    lodge_button: Query<&Interaction, With<HuntingLodgeButton>>,
     window: Query<&Window, With<PrimaryWindow>>,
     camera: Query<&Transform, With<Camera2d>>,
     mut selected: ResMut<SelectedHex>,
     zoom: Res<Zoom>,
 ) {
     if !mouse.just_pressed(MouseButton::Right) {
+        return;
+    }
+    if pointer_over_ingame_ui(blockers, lodge_button) {
         return;
     }
     let Some(mouse_pos) = window.single().cursor_position() else {
@@ -2444,6 +2542,9 @@ fn spawn_pause_menu(mut commands: Commands, theme: Res<UiTheme>) {
             GlobalZIndex(GLOBAL_Z_MENU_PANEL),
             MenuRoot,
             PauseMenuLayer,
+            BlocksWorldInput,
+            FocusPolicy::Block,
+            Interaction::None,
         ))
         .with_children(|overlay| {
             overlay
@@ -2584,6 +2685,8 @@ fn on_menu_screen_changed(
     screen: Res<MenuScreen>,
     epoch: Res<MenuScreenEpoch>,
     mut motion: ResMut<MenuMotion>,
+    mut placement_mode: ResMut<BuildingPlacementMode>,
+    mut mesh_cache: ResMut<LodgeBlueprintMeshCache>,
     mut last_epoch: Local<u32>,
     mut last: Local<MenuScreen>,
     mut overlay: Query<
@@ -2637,6 +2740,7 @@ fn on_menu_screen_changed(
             motion.exit_panel = prev;
         }
         (MenuScreen::Closed, MenuScreen::Main) => {
+            cancel_lodge_placement(&mut placement_mode, &mut mesh_cache);
             motion.phase = MenuMotionPhase::Enter;
             motion.duration = MENU_ENTER_SECS;
             motion.intro_panel = MenuScreen::Main;
@@ -3037,8 +3141,10 @@ fn examiner_tile_fields(
 
 fn handle_examiner_click(
     mouse: Res<ButtonInput<MouseButton>>,
+    screen: Res<MenuScreen>,
     mode: Res<BuildingPlacementMode>,
     suppress: Res<LodgePlacementSuppressClick>,
+    blockers: Query<&Interaction, With<BlocksWorldInput>>,
     lodge_button: Query<&Interaction, With<HuntingLodgeButton>>,
     window: Query<&Window, With<PrimaryWindow>>,
     camera: Query<&Transform, With<Camera2d>>,
@@ -3046,10 +3152,13 @@ fn handle_examiner_click(
     placed: Res<PlacedLodges>,
     mut examiner: ResMut<ExaminerSelection>,
 ) {
-    if mode.is_placing_lodge() || !mouse.just_pressed(MouseButton::Left) {
+    if mode.is_placing_lodge()
+        || pause_menu_open(&screen)
+        || !mouse.just_pressed(MouseButton::Left)
+    {
         return;
     }
-    if suppress.frames > 0 || pointer_over_hunting_lodge_button(lodge_button) {
+    if suppress.frames > 0 || pointer_over_ingame_ui(blockers, lodge_button) {
         return;
     }
     let Some(mouse_pos) = window.single().cursor_position() else {
@@ -3195,7 +3304,19 @@ fn update_examiner_panel(
     >,
     mut building_block: Query<
         (&mut Visibility, &mut Node),
-        (With<ExaminerBuildingBlock>, Without<HoverEmptyHint>),
+        (
+            With<ExaminerBuildingBlock>,
+            Without<HoverEmptyHint>,
+            Without<ExaminerBuildingDivider>,
+        ),
+    >,
+    mut building_divider: Query<
+        (&mut Visibility, &mut Node),
+        (
+            With<ExaminerBuildingDivider>,
+            Without<HoverEmptyHint>,
+            Without<ExaminerBuildingBlock>,
+        ),
     >,
 ) {
     let building_selected = matches!(examiner.0, Some(ExaminerFocus::Building(_)));
@@ -3210,6 +3331,9 @@ fn update_examiner_panel(
         return;
     };
     let Ok((mut block_vis, mut block_node)) = building_block.get_single_mut() else {
+        return;
+    };
+    let Ok((mut divider_vis, mut divider_node)) = building_divider.get_single_mut() else {
         return;
     };
 
@@ -3260,6 +3384,16 @@ fn update_examiner_panel(
         Visibility::Hidden
     };
     block_node.display = if show_building {
+        Display::Flex
+    } else {
+        Display::None
+    };
+    *divider_vis = if show_building {
+        Visibility::Visible
+    } else {
+        Visibility::Hidden
+    };
+    divider_node.display = if show_building {
         Display::Flex
     } else {
         Display::None
@@ -3335,11 +3469,13 @@ fn terrain_category(t: TerrainType) -> Option<&'static str> {
 
 fn end_turn(
     keys: Res<ButtonInput<KeyCode>>,
+    screen: Res<MenuScreen>,
     mut gs: ResMut<GameState>,
     mut query: Query<&mut Text, With<TurnText>>,
     map: Res<GameMap>,
 ) {
-    if !keys.just_pressed(KeyCode::Enter) {
+    let advance = keys.just_pressed(KeyCode::Space) || keys.just_pressed(KeyCode::Enter);
+    if !advance || pause_menu_open(&screen) {
         return;
     }
     gs.next_turn(&map.0);
