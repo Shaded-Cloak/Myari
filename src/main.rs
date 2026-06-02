@@ -1,5 +1,6 @@
 mod app_state;
 mod buildings;
+mod footprint_mesh;
 mod game;
 mod hexgrid;
 mod map;
@@ -22,7 +23,7 @@ use bevy_pancam::{PanCam, PanCamPlugin};
 use rand::Rng;
 use std::collections::{HashMap, HashSet};
 
-use buildings::{can_place_lodge, lodge_coords};
+use buildings::{can_place_lodge, lodge_coords, PlacedLodges};
 use game::GameState;
 use crate::hexgrid::{axial_to_pixel, hex_corners_at, hex_corners_local, hex_world_bounds, pixel_to_hex, HexCoord};
 use map::{Map, HexTile, TerrainType, MAP_RADIUS};
@@ -64,10 +65,17 @@ const MAP_CAMERA_PADDING: f32 = 1.06;
 const GRID_HEX_PX_FADE_START: f32 = 28.0;
 /// Grid hidden when hex height on screen is at or below this (only at extreme zoom-out).
 const GRID_HEX_PX_FADE_END: f32 = 7.0;
-/// Placeholder fill for a placed hunting lodge hex.
-const LODGE_TILE_BROWN: Color = Color::srgb(0.45, 0.28, 0.12);
-const LODGE_GHOST_VALID: Color = Color::srgba(0.85, 0.72, 0.35, 0.88);
-const LODGE_GHOST_INVALID: Color = Color::srgba(0.9, 0.25, 0.2, 0.88);
+/// Placed lodge inset fill (opaque; same hue as blueprint).
+const LODGE_BUILDING_FILL: Color = Color::srgb(0.45, 0.28, 0.12);
+/// Selection highlight fill — blueprint look, fully opaque.
+const LODGE_SELECTION_FILL: Color = Color::srgb(0.45, 0.28, 0.12);
+const LODGE_BLUEPRINT_FILL: Color = Color::srgba(0.45, 0.28, 0.12, 0.72);
+const LODGE_BLUEPRINT_STROKE_VALID: Color = Color::srgba(0.85, 0.72, 0.35, 0.9);
+const LODGE_BLUEPRINT_STROKE_INVALID: Color = Color::srgba(0.05, 0.05, 0.05, 0.95);
+/// Terrain margin around building fill (constant-distance inset from footprint boundary).
+const LODGE_BUILDING_MARGIN: f32 = 7.0;
+const LODGE_PLACE_START_SCALE: f32 = 0.2;
+const LODGE_PLACE_POP_SECS: f32 = 0.48;
 
 fn main() {
     println!("Myari starting up...");
@@ -86,6 +94,10 @@ fn main() {
         .init_resource::<HoveredHex>()
         .init_resource::<BuildingPlacementMode>()
         .init_resource::<PlacedLodges>()
+        .init_resource::<ExaminerSelection>()
+        .init_resource::<LodgePlacementRotation>()
+        .init_resource::<LodgeBlueprintMeshCache>()
+        .init_resource::<LodgePlacementSuppressClick>()
         .init_resource::<FpsCounter>()
         .init_resource::<GridVisible>()
         .init_resource::<MenuScreen>()
@@ -148,12 +160,17 @@ fn main() {
         )
         .add_systems(
             OnEnter(AppState::Loading),
-            reset_pause_menu_for_session,
+            (reset_pause_menu_for_session, reset_lodge_placement_on_session),
+        )
+        .add_systems(
+            OnEnter(AppState::MainMenu),
+            reset_lodge_placement_on_session,
         )
         .add_systems(
             OnEnter(AppState::InGame),
             (
                 reset_pause_menu_for_session,
+                reset_lodge_placement_on_session,
                 restore_hud_ornament_colors,
                 frame_camera_to_map,
                 reset_hover_highlight_on_enter,
@@ -165,7 +182,9 @@ fn main() {
             (
                 track_hover,
                 animate_hover_highlight,
-                update_hover_panel,
+                update_examiner_panel,
+                handle_examiner_click,
+                animate_selection_highlight,
                 handle_selection,
                 move_selected_unit,
                 handle_menu_escape,
@@ -175,22 +194,25 @@ fn main() {
                 handle_quit_to_main_menu_button,
                 style_menu_buttons,
                 (handle_toggle_button, sync_grid_for_zoom).chain(),
-                fps_update,
-                end_turn,
             )
                 .run_if(in_state(AppState::InGame)),
         )
         .add_systems(
             Update,
             (
+                fps_update,
+                end_turn,
                 reroll_world,
                 save_game,
                 load_game,
-                update_lodge_placement_ghost,
+                animate_lodge_blueprint,
                 handle_hunting_lodge_button,
                 sync_hunting_lodge_toolbar,
+                handle_lodge_rotate,
                 handle_lodge_placement_click,
                 cancel_lodge_placement_on_escape,
+                tick_lodge_placement_suppress,
+                animate_lodge_place_pop,
             )
                 .run_if(in_state(AppState::InGame)),
         )
@@ -356,9 +378,34 @@ impl BuildingPlacementMode {
 }
 
 #[derive(Resource, Default)]
-struct PlacedLodges {
-    anchors: Vec<HexCoord>,
-    occupied: HashSet<HexCoord>,
+struct LodgePlacementRotation(u8);
+
+#[derive(Resource, Default)]
+struct LodgePlacementSuppressClick {
+    frames: u8,
+}
+
+#[derive(Resource, Default)]
+struct LodgeBlueprintMeshCache {
+    rotation: Option<u8>,
+    fill: Option<Handle<Mesh>>,
+    outline: Option<Handle<Mesh>>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ExaminerFocus {
+    Tile(HexCoord),
+    Building(usize),
+}
+
+#[derive(Resource, Default)]
+struct ExaminerSelection(Option<ExaminerFocus>);
+
+#[derive(Resource, Default)]
+struct SelectionBuildingMeshCache {
+    rotation: Option<u8>,
+    fill: Option<Handle<Mesh>>,
+    outline: Option<Handle<Mesh>>,
 }
 
 #[derive(Component)]
@@ -368,12 +415,21 @@ struct HuntingLodgeButton;
 struct HuntingLodgeButtonLabel;
 
 #[derive(Component)]
-struct LodgeGhost {
-    slot: u8,
-}
+struct LodgeBlueprint;
+
+#[derive(Component)]
+struct LodgeBlueprintFill;
+
+#[derive(Component)]
+struct LodgeBlueprintOutline;
 
 #[derive(Component)]
 struct LodgeTile;
+
+#[derive(Component)]
+struct LodgePlacePop {
+    elapsed: f32,
+}
 
 #[derive(Resource, Default)]
 struct FpsCounter {
@@ -515,6 +571,27 @@ struct HoverCoordsR;
 struct HoverEmptyHint;
 
 #[derive(Component)]
+struct ExaminerBuildingBlock;
+
+#[derive(Component)]
+struct ExaminerBuildingNameText;
+
+#[derive(Component)]
+struct ExaminerBuildingFoodText;
+
+#[derive(Component)]
+struct SelectionTileRing;
+
+#[derive(Component)]
+struct SelectionBuildingRoot;
+
+#[derive(Component)]
+struct SelectionBuildingFill;
+
+#[derive(Component)]
+struct SelectionBuildingOutline;
+
+#[derive(Component)]
 struct UnitMarker {
     civ_idx: usize,
     unit_idx: usize,
@@ -533,7 +610,7 @@ fn setup_camera(mut commands: Commands) {
     commands.spawn((
         Camera2d,
         PanCam {
-            grab_buttons: vec![MouseButton::Left, MouseButton::Middle],
+            grab_buttons: vec![MouseButton::Right],
             zoom_to_cursor: true,
             min_scale: 0.02,
             max_scale: 60.0,
@@ -546,7 +623,6 @@ fn sync_pancam(
     app_state: Res<State<AppState>>,
     screen: Res<MenuScreen>,
     motion: Res<MenuMotion>,
-    placement: Res<BuildingPlacementMode>,
     mut cameras: Query<&mut PanCam>,
 ) {
     if let Ok(mut pan) = cameras.get_single_mut() {
@@ -555,11 +631,7 @@ fn sync_pancam(
             || motion.phase == MenuMotionPhase::Teardown;
         let in_game = *app_state.get() == AppState::InGame && !pause_visible;
         pan.enabled = in_game;
-        if in_game && placement.is_placing_lodge() {
-            pan.grab_buttons = vec![MouseButton::Middle];
-        } else {
-            pan.grab_buttons = vec![MouseButton::Left, MouseButton::Middle];
-        }
+        pan.grab_buttons = vec![MouseButton::Right];
     }
 }
 
@@ -613,6 +685,49 @@ fn sync_grid_for_zoom(
             Visibility::Hidden
         };
     }
+}
+
+fn map_center_tile(map: &Map) -> HexCoord {
+    let center = HexCoord::origin();
+    if map.tile_at(center).is_some() {
+        return center;
+    }
+    map.tiles
+        .iter()
+        .min_by_key(|t| t.coord.distance(&center))
+        .map(|t| t.coord)
+        .unwrap_or(center)
+}
+
+fn default_examiner_focus(map: &Map, placed: &PlacedLodges) -> ExaminerFocus {
+    let coord = map_center_tile(map);
+    placed
+        .lodge_index_at(coord)
+        .map(ExaminerFocus::Building)
+        .unwrap_or(ExaminerFocus::Tile(coord))
+}
+
+fn reset_lodge_placement_on_session(
+    mut mode: ResMut<BuildingPlacementMode>,
+    mut rotation: ResMut<LodgePlacementRotation>,
+    mut placed: ResMut<PlacedLodges>,
+    mut mesh_cache: ResMut<LodgeBlueprintMeshCache>,
+    mut suppress: ResMut<LodgePlacementSuppressClick>,
+    mut examiner: ResMut<ExaminerSelection>,
+    state: Res<State<AppState>>,
+    map: Option<Res<GameMap>>,
+) {
+    *mode = BuildingPlacementMode::Idle;
+    rotation.0 = 0;
+    *placed = PlacedLodges::default();
+    mesh_cache.rotation = None;
+    suppress.frames = 0;
+    examiner.0 = match *state.get() {
+        AppState::InGame => map
+            .as_deref()
+            .map(|m| default_examiner_focus(&m.0, &placed)),
+        _ => None,
+    };
 }
 
 fn reset_hover_highlight_on_enter(mut highlight: Query<&mut Visibility, With<Highlight>>) {
@@ -852,16 +967,69 @@ fn loading_pipeline(
                         Visibility::Hidden,
                         Highlight,
                     ));
-                    let ghost_mesh = meshes.add(make_hex_ring_mesh(HEX_SIZE, HOVER_OUTLINE_STROKE));
-                    for slot in 0..4u8 {
-                        commands.spawn((
-                            Mesh2d(ghost_mesh.clone()),
-                            MeshMaterial2d(materials.add(ColorMaterial::from_color(LODGE_GHOST_VALID))),
-                            Transform::from_xyz(0.0, 0.0, 5.0),
+                    let (bp_fill, bp_outline) = lodge_meshes_for_rotation(&mut meshes, 0);
+                    let blueprint_fill_mat =
+                        materials.add(ColorMaterial::from_color(LODGE_BLUEPRINT_FILL));
+                    let blueprint_stroke_mat =
+                        materials.add(ColorMaterial::from_color(LODGE_BLUEPRINT_STROKE_VALID));
+                    commands
+                        .spawn((Transform::default(), Visibility::Hidden, LodgeBlueprint))
+                        .with_children(|root| {
+                            root.spawn((
+                                Mesh2d(bp_fill),
+                                MeshMaterial2d(blueprint_fill_mat),
+                                Transform::from_xyz(0.0, 0.0, 4.8),
+                                LodgeBlueprintFill,
+                            ));
+                            root.spawn((
+                                Mesh2d(bp_outline),
+                                MeshMaterial2d(blueprint_stroke_mat),
+                                Transform::from_xyz(0.0, 0.0, 5.0),
+                                LodgeBlueprintOutline,
+                            ));
+                        });
+                    commands.insert_resource(LodgeBlueprintMeshCache {
+                        rotation: Some(0),
+                        fill: None,
+                        outline: None,
+                    });
+                    let sel_mat = materials.add(ColorMaterial::from_color(GOLD));
+                    let sel_ring = meshes.add(make_hex_ring_mesh(HEX_SIZE, HOVER_OUTLINE_STROKE));
+                    commands.spawn((
+                        Mesh2d(sel_ring),
+                        MeshMaterial2d(sel_mat.clone()),
+                        Transform::from_xyz(0.0, 0.0, 5.2),
+                        Visibility::Hidden,
+                        SelectionTileRing,
+                    ));
+                    let (sel_fill, sel_outline) = lodge_selection_meshes_for_rotation(&mut meshes, 0);
+                    let sel_fill_mat =
+                        materials.add(ColorMaterial::from_color(LODGE_SELECTION_FILL));
+                    commands
+                        .spawn((
+                            Transform::default(),
                             Visibility::Hidden,
-                            LodgeGhost { slot },
-                        ));
-                    }
+                            SelectionBuildingRoot,
+                        ))
+                        .with_children(|root| {
+                            root.spawn((
+                                Mesh2d(sel_fill),
+                                MeshMaterial2d(sel_fill_mat),
+                                Transform::from_xyz(0.0, 0.0, 0.0),
+                                SelectionBuildingFill,
+                            ));
+                            root.spawn((
+                                Mesh2d(sel_outline),
+                                MeshMaterial2d(sel_mat),
+                                Transform::from_xyz(0.0, 0.0, 0.05),
+                                SelectionBuildingOutline,
+                            ));
+                        });
+                    commands.insert_resource(SelectionBuildingMeshCache {
+                        rotation: Some(0),
+                        fill: None,
+                        outline: None,
+                    });
                     ui_ready.0 = true;
                 }
 
@@ -960,7 +1128,7 @@ fn spawn_game_hud(commands: &mut Commands, theme: &UiTheme, seed: u64) {
             spawn_ornate_divider(panel, theme, false);
             panel.spawn(theme.label("SEED"));
             panel.spawn((theme.value(seed.to_string(), 15.0), SeedText));
-            panel.spawn(theme.hint("Press R to reroll world", 11.0));
+            panel.spawn(theme.hint("Press \\ to reroll world", 11.0));
         },
     );
 }
@@ -977,7 +1145,7 @@ fn spawn_hover_panel(commands: &mut Commands, theme: &UiTheme, images: &mut Asse
         UiRect::new(Val::Px(18.0), Val::Px(16.0), Val::Px(16.0), Val::Px(18.0)),
         12.0,
         |panel, theme| {
-            panel.spawn((theme.label("TILE"), HoverPanel));
+            panel.spawn((theme.label("EXAMINER"), HoverPanel));
 
             panel
                 .spawn((
@@ -1015,6 +1183,27 @@ fn spawn_hover_panel(commands: &mut Commands, theme: &UiTheme, images: &mut Asse
                     Node {
                         width: Val::Percent(100.0),
                         flex_direction: FlexDirection::Column,
+                        row_gap: Val::Px(8.0),
+                        display: Display::None,
+                        ..default()
+                    },
+                    Visibility::Hidden,
+                    ExaminerBuildingBlock,
+                ))
+                .with_children(|block| {
+                    block.spawn(theme.label("BUILDING"));
+                    block.spawn((theme.value("—", 22.0), ExaminerBuildingNameText));
+                    block.spawn(theme.label("FOOD STORED"));
+                    block.spawn((theme.value("—", 19.0), ExaminerBuildingFoodText));
+                });
+
+            spawn_ornate_divider(panel, theme, false);
+
+            panel
+                .spawn((
+                    Node {
+                        width: Val::Percent(100.0),
+                        flex_direction: FlexDirection::Column,
                         row_gap: Val::Px(5.0),
                         ..default()
                     },
@@ -1038,7 +1227,7 @@ fn spawn_hover_panel(commands: &mut Commands, theme: &UiTheme, images: &mut Asse
                 });
 
             panel.spawn((
-                theme.hint("Move cursor over a hex", 11.0),
+                theme.hint("Click a tile or building", 11.0),
                 HoverEmptyHint,
             ));
 
@@ -1466,29 +1655,116 @@ fn make_map_border_stroke_from_edges(edges: &[MapBorderEdge], stroke: f32) -> Me
     mesh
 }
 
-fn make_hex_fill_mesh(size: f32) -> Mesh {
-    let (cx, cy) = (0.0_f32, 0.0_f32);
-    let corners = hex_corners_local(size);
-    let c = LODGE_TILE_BROWN.to_linear().to_f32_array();
-    let mut positions: Vec<[f32; 3]> = Vec::with_capacity(7);
-    let mut colors: Vec<[f32; 4]> = Vec::with_capacity(7);
-    positions.push([cx, cy, 0.0]);
-    colors.push(c);
-    for &(x, y) in &corners {
-        positions.push([x, y, 0.0]);
-        colors.push(c);
+fn build_footprint_border_edges(coords: &[HexCoord], hex_size: f32) -> Vec<MapBorderEdge> {
+    let set: HashSet<HexCoord> = coords.iter().copied().collect();
+    let mut edges = Vec::new();
+    for coord in coords {
+        let (cx, cy) = axial_to_pixel(coord.q, coord.r, hex_size);
+        let center = Vec2::new(cx, cy);
+        let corners = hex_corners_at(coord.q, coord.r, hex_size);
+        let neighbors = coord.neighbors();
+        for i in 0..6 {
+            if set.contains(&neighbors[i]) {
+                continue;
+            }
+            let a = Vec2::new(corners[i].0, corners[i].1);
+            let b = Vec2::new(corners[(i + 1) % 6].0, corners[(i + 1) % 6].1);
+            edges.push(MapBorderEdge {
+                a,
+                b,
+                outward: exterior_edge_outward(center, a, b),
+            });
+        }
     }
-    let mut indices: Vec<u32> = Vec::with_capacity(18);
-    for i in 0..6 {
-        indices.push(0);
-        indices.push(1 + i);
-        indices.push(1 + ((i + 1) % 6));
-    }
+    edges
+}
+
+fn make_footprint_fill_mesh(
+    coords: &[HexCoord],
+    hex_size: f32,
+    origin: Vec2,
+    color: Color,
+    margin: f32,
+) -> Mesh {
+    let c = color.to_linear().to_f32_array();
+    let (positions, colors, indices) =
+        footprint_mesh::make_footprint_fill_mesh(coords, hex_size, origin, c, margin);
     let mut mesh = Mesh::new(PrimitiveTopology::TriangleList, Default::default());
     mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, positions);
     mesh.insert_attribute(Mesh::ATTRIBUTE_COLOR, colors);
-    mesh.insert_indices(Indices::U32(indices));
+    if !indices.is_empty() {
+        mesh.insert_indices(Indices::U32(indices));
+    }
     mesh
+}
+
+fn make_footprint_outline_mesh(coords: &[HexCoord], hex_size: f32, origin: Vec2, stroke: f32) -> Mesh {
+    let edges = build_footprint_border_edges(coords, hex_size);
+    let local_edges: Vec<MapBorderEdge> = edges
+        .into_iter()
+        .map(|e| MapBorderEdge {
+            a: e.a - origin,
+            b: e.b - origin,
+            outward: e.outward,
+        })
+        .collect();
+    make_map_border_stroke_from_edges(&local_edges, stroke)
+}
+
+fn lodge_outline_mesh_for_rotation(meshes: &mut Assets<Mesh>, rotation: u8) -> Handle<Mesh> {
+    let coords = lodge_coords(HexCoord::origin(), rotation);
+    let origin = footprint_mesh::footprint_centroid(&coords, HEX_SIZE);
+    meshes.add(make_footprint_outline_mesh(
+        &coords,
+        HEX_SIZE,
+        origin,
+        HOVER_OUTLINE_STROKE,
+    ))
+}
+
+fn lodge_footprint_fill_mesh_for_rotation(
+    meshes: &mut Assets<Mesh>,
+    rotation: u8,
+    color: Color,
+    margin: f32,
+) -> Handle<Mesh> {
+    let coords = lodge_coords(HexCoord::origin(), rotation);
+    let origin = footprint_mesh::footprint_centroid(&coords, HEX_SIZE);
+    meshes.add(make_footprint_fill_mesh(
+        &coords,
+        HEX_SIZE,
+        origin,
+        color,
+        margin,
+    ))
+}
+
+fn lodge_selection_meshes_for_rotation(
+    meshes: &mut Assets<Mesh>,
+    rotation: u8,
+) -> (Handle<Mesh>, Handle<Mesh>) {
+    let fill = lodge_footprint_fill_mesh_for_rotation(
+        meshes,
+        rotation,
+        LODGE_SELECTION_FILL,
+        LODGE_BUILDING_MARGIN,
+    );
+    let outline = lodge_outline_mesh_for_rotation(meshes, rotation);
+    (fill, outline)
+}
+
+fn lodge_meshes_for_rotation(
+    meshes: &mut Assets<Mesh>,
+    rotation: u8,
+) -> (Handle<Mesh>, Handle<Mesh>) {
+    let fill = lodge_footprint_fill_mesh_for_rotation(
+        meshes,
+        rotation,
+        LODGE_BLUEPRINT_FILL,
+        LODGE_BUILDING_MARGIN,
+    );
+    let outline = lodge_outline_mesh_for_rotation(meshes, rotation);
+    (fill, outline)
 }
 
 /// One continuous hex ring — inner/outer contours share vertices at each corner.
@@ -1633,13 +1909,31 @@ fn screen_to_world(cam: &Transform, window_size: Vec2, screen_pos: Vec2, zoom: f
     cam.translation.truncate() + ndc * window_size * 0.5 * zoom
 }
 
+fn pointer_over_hunting_lodge_button(
+    buttons: Query<&Interaction, With<HuntingLodgeButton>>,
+) -> bool {
+    buttons
+        .iter()
+        .any(|i| matches!(*i, Interaction::Hovered | Interaction::Pressed))
+}
+
 fn track_hover(
+    mode: Res<BuildingPlacementMode>,
     window: Query<&Window, With<PrimaryWindow>>,
     camera: Query<&Transform, With<Camera2d>>,
     mut hovered: ResMut<HoveredHex>,
     zoom: Res<Zoom>,
+    lodge_button: Query<&Interaction, With<HuntingLodgeButton>>,
     mut cursor_evr: EventReader<CursorMoved>,
 ) {
+    if pointer_over_hunting_lodge_button(lodge_button) {
+        // While placing, keep the last map hex so the blueprint stays visible over the button.
+        if mode.is_placing_lodge() {
+            return;
+        }
+        hovered.0 = None;
+        return;
+    }
     let Some(ev) = cursor_evr.read().last() else { return; };
     let cam = camera.single();
     let ws = Vec2::new(window.single().width(), window.single().height());
@@ -1649,6 +1943,7 @@ fn track_hover(
 
 fn animate_hover_highlight(
     time: Res<Time>,
+    mode: Res<BuildingPlacementMode>,
     hovered: Res<HoveredHex>,
     mut materials: ResMut<Assets<ColorMaterial>>,
     mut query: Query<
@@ -1659,6 +1954,12 @@ fn animate_hover_highlight(
     let Ok((mut transform, mut visibility, material)) = query.get_single_mut() else {
         return;
     };
+
+    if mode.is_placing_lodge() {
+        *visibility = Visibility::Hidden;
+        transform.scale = Vec3::ONE;
+        return;
+    }
 
     let Some(hex) = hovered.0 else {
         *visibility = Visibility::Hidden;
@@ -1705,15 +2006,30 @@ fn animate_hover_highlight(
 fn handle_hunting_lodge_button(
     mut interaction: Query<&Interaction, (Changed<Interaction>, With<HuntingLodgeButton>)>,
     mut mode: ResMut<BuildingPlacementMode>,
+    mut rotation: ResMut<LodgePlacementRotation>,
+    mut mesh_cache: ResMut<LodgeBlueprintMeshCache>,
+    mut suppress: ResMut<LodgePlacementSuppressClick>,
 ) {
     for interaction in &mut interaction {
         if *interaction != Interaction::Pressed {
             continue;
         }
+        let entering = !mode.is_placing_lodge();
         *mode = match *mode {
             BuildingPlacementMode::Idle => BuildingPlacementMode::PlacingHuntingLodge,
             BuildingPlacementMode::PlacingHuntingLodge => BuildingPlacementMode::Idle,
         };
+        if entering && mode.is_placing_lodge() {
+            rotation.0 = 0;
+            mesh_cache.rotation = None;
+            suppress.frames = 5;
+        }
+    }
+}
+
+fn tick_lodge_placement_suppress(mut suppress: ResMut<LodgePlacementSuppressClick>) {
+    if suppress.frames > 0 {
+        suppress.frames -= 1;
     }
 }
 
@@ -1729,7 +2045,7 @@ fn sync_hunting_lodge_toolbar(
     let placing = mode.is_placing_lodge();
     for mut text in &mut label {
         text.0 = if placing {
-            "Hunting Lodge (placing)".to_string()
+            "Hunting Lodge — R rotate".to_string()
         } else {
             "Hunting Lodge".to_string()
         };
@@ -1759,57 +2075,124 @@ fn cancel_lodge_placement_on_escape(
     *mode = BuildingPlacementMode::Idle;
 }
 
-fn update_lodge_placement_ghost(
+fn handle_lodge_rotate(
+    keys: Res<ButtonInput<KeyCode>>,
+    mode: Res<BuildingPlacementMode>,
+    mut rotation: ResMut<LodgePlacementRotation>,
+) {
+    if !mode.is_placing_lodge() || !keys.just_pressed(KeyCode::KeyR) {
+        return;
+    }
+    rotation.0 = (rotation.0 + 1) % 6;
+}
+
+fn animate_lodge_blueprint(
+    time: Res<Time>,
     mode: Res<BuildingPlacementMode>,
     hovered: Res<HoveredHex>,
+    rotation: Res<LodgePlacementRotation>,
     map: Res<GameMap>,
     placed: Res<PlacedLodges>,
-    mut ghosts: Query<(
-        &LodgeGhost,
-        &mut Transform,
-        &mut Visibility,
-        &MeshMaterial2d<ColorMaterial>,
-    )>,
+    mut mesh_cache: ResMut<LodgeBlueprintMeshCache>,
+    mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<ColorMaterial>>,
+    mut blueprint: Query<
+        (&mut Transform, &mut Visibility),
+        (With<LodgeBlueprint>, Without<LodgeBlueprintFill>),
+    >,
+    mut fill: Query<
+        (&mut Mesh2d, &MeshMaterial2d<ColorMaterial>),
+        (With<LodgeBlueprintFill>, Without<LodgeBlueprintOutline>),
+    >,
+    mut outline: Query<
+        (&mut Mesh2d, &MeshMaterial2d<ColorMaterial>),
+        (With<LodgeBlueprintOutline>, Without<LodgeBlueprintFill>),
+    >,
 ) {
+    let Ok((mut root_transform, mut root_visibility)) = blueprint.get_single_mut() else {
+        return;
+    };
+
     if !mode.is_placing_lodge() {
-        for (_, _, mut vis, _) in &mut ghosts {
-            *vis = Visibility::Hidden;
-        }
+        *root_visibility = Visibility::Hidden;
+        root_transform.scale = Vec3::ONE;
         return;
     }
-    let Some(anchor) = hovered.0 else {
-        for (_, _, mut vis, _) in &mut ghosts {
-            *vis = Visibility::Hidden;
-        }
+
+    let Some(center) = hovered.0 else {
+        *root_visibility = Visibility::Hidden;
+        root_transform.scale = Vec3::ONE;
         return;
     };
-    let valid = can_place_lodge(&map.0, &placed.occupied, anchor);
-    let ghost_color = if valid {
-        LODGE_GHOST_VALID
+
+    if mesh_cache.rotation != Some(rotation.0) {
+        let (fill_h, outline_h) = lodge_meshes_for_rotation(&mut meshes, rotation.0);
+        mesh_cache.rotation = Some(rotation.0);
+        mesh_cache.fill = Some(fill_h.clone());
+        mesh_cache.outline = Some(outline_h.clone());
+        if let Ok((mut mesh2d, _)) = fill.get_single_mut() {
+            mesh2d.0 = fill_h;
+        }
+        if let Ok((mut mesh2d, _)) = outline.get_single_mut() {
+            mesh2d.0 = outline_h;
+        }
+    }
+
+    let coords = lodge_coords(center, rotation.0);
+    let valid = can_place_lodge(&map.0, &*placed, center, rotation.0);
+    let centroid = footprint_mesh::footprint_centroid(&coords, HEX_SIZE);
+    let target = Vec2::new(centroid.x, centroid.y);
+    let dt = time.delta_secs();
+
+    if *root_visibility == Visibility::Hidden {
+        root_transform.translation = Vec3::new(target.x, target.y, 5.0);
+        root_transform.scale = Vec3::ONE;
+        *root_visibility = Visibility::Visible;
     } else {
-        LODGE_GHOST_INVALID
+        let current = root_transform.translation.truncate();
+        let pos = smooth_follow_vec2_distance_speed(
+            current,
+            target,
+            dt,
+            HOVER_GLOW_SPEED_NEAR,
+            HOVER_GLOW_SPEED_FAR,
+            HEX_SIZE * 0.35,
+            HEX_SIZE * 2.8,
+        );
+        root_transform.translation = Vec3::new(pos.x, pos.y, 5.0);
+    }
+
+    let pulse = (time.elapsed_secs() * std::f32::consts::TAU * HOVER_GLOW_PULSE_HZ).sin();
+    root_transform.scale = Vec3::splat(1.0 + pulse * HOVER_GLOW_PULSE_SCALE);
+
+    let stroke_color = if valid {
+        LODGE_BLUEPRINT_STROKE_VALID
+    } else {
+        LODGE_BLUEPRINT_STROKE_INVALID
     };
-    let coords = lodge_coords(anchor);
-    for (ghost, mut transform, mut visibility, material) in &mut ghosts {
-        let idx = ghost.slot as usize;
-        if idx >= coords.len() {
-            *visibility = Visibility::Hidden;
-            continue;
-        }
-        let (tx, ty) = axial_to_pixel(coords[idx].q, coords[idx].r, HEX_SIZE);
-        transform.translation = Vec3::new(tx, ty, 5.0);
-        *visibility = Visibility::Visible;
-        if let Some(mat) = materials.get_mut(&material.0) {
-            mat.color = ghost_color;
+    let stroke_alpha = HOVER_GLOW_ALPHA_BASE + pulse * HOVER_GLOW_ALPHA_AMP;
+    if let Ok((_, mat)) = outline.get_single() {
+        if let Some(m) = materials.get_mut(&mat.0) {
+            m.color = stroke_color.with_alpha(stroke_alpha);
         }
     }
+    if let Ok((_, mat)) = fill.get_single() {
+        if let Some(m) = materials.get_mut(&mat.0) {
+            let mut c = LODGE_BLUEPRINT_FILL;
+            c = c.with_alpha(LODGE_BLUEPRINT_FILL.alpha() * (0.92 + pulse * 0.06));
+            m.color = c;
+        }
+    }
+    *root_visibility = Visibility::Visible;
 }
 
 fn handle_lodge_placement_click(
     mouse: Res<ButtonInput<MouseButton>>,
     mode: Res<BuildingPlacementMode>,
+    suppress: Res<LodgePlacementSuppressClick>,
+    lodge_button: Query<&Interaction, With<HuntingLodgeButton>>,
     hovered: Res<HoveredHex>,
+    rotation: Res<LodgePlacementRotation>,
     map: Res<GameMap>,
     mut placed: ResMut<PlacedLodges>,
     mut commands: Commands,
@@ -1819,36 +2202,68 @@ fn handle_lodge_placement_click(
     if !mode.is_placing_lodge() || !mouse.just_pressed(MouseButton::Left) {
         return;
     }
-    let Some(anchor) = hovered.0 else {
+    if suppress.frames > 0 || pointer_over_hunting_lodge_button(lodge_button) {
+        return;
+    }
+    let Some(center) = hovered.0 else {
         return;
     };
-    if !can_place_lodge(&map.0, &placed.occupied, anchor) {
+    if !can_place_lodge(&map.0, &*placed, center, rotation.0) {
         return;
     }
-    spawn_lodge_tiles(&mut commands, &mut meshes, &mut materials, anchor);
-    for coord in lodge_coords(anchor) {
-        placed.occupied.insert(coord);
-    }
-    placed.anchors.push(anchor);
+    spawn_lodge_building(
+        &mut commands,
+        &mut meshes,
+        &mut materials,
+        center,
+        rotation.0,
+    );
+    placed.register_lodge(center, rotation.0);
 }
 
-fn spawn_lodge_tiles(
+fn spawn_lodge_building(
     commands: &mut Commands,
     meshes: &mut ResMut<Assets<Mesh>>,
     materials: &mut ResMut<Assets<ColorMaterial>>,
-    anchor: HexCoord,
+    center: HexCoord,
+    rotation: u8,
 ) {
-    let mesh = meshes.add(make_hex_fill_mesh(HEX_SIZE * 0.92));
-    let mat = materials.add(ColorMaterial::from_color(LODGE_TILE_BROWN));
-    for coord in lodge_coords(anchor) {
-        let (tx, ty) = axial_to_pixel(coord.q, coord.r, HEX_SIZE);
-        commands.spawn((
-            Mesh2d(mesh.clone()),
-            MeshMaterial2d(mat.clone()),
-            Transform::from_xyz(tx, ty, 1.0),
-            LodgeTile,
-            WorldEntity,
-        ));
+    let coords = lodge_coords(center, rotation);
+    let origin = footprint_mesh::footprint_centroid(&coords, HEX_SIZE);
+    let fill_mesh = meshes.add(make_footprint_fill_mesh(
+        &coords,
+        HEX_SIZE,
+        origin,
+        LODGE_BUILDING_FILL,
+        LODGE_BUILDING_MARGIN,
+    ));
+    let fill_mat = materials.add(ColorMaterial::from_color(LODGE_BUILDING_FILL));
+    commands.spawn((
+        Mesh2d(fill_mesh),
+        MeshMaterial2d(fill_mat),
+        Transform::from_xyz(origin.x, origin.y, 4.6),
+        LodgeTile,
+        LodgePlacePop { elapsed: 0.0 },
+        WorldEntity,
+    ));
+}
+
+fn lodge_place_pop_transform(t: f32) -> Transform {
+    let t = t.clamp(0.0, 1.0);
+    let eased = ease_out_cubic(t);
+    let scale = LODGE_PLACE_START_SCALE + (1.0 - LODGE_PLACE_START_SCALE) * eased;
+    Transform::from_scale(Vec3::splat(scale))
+}
+
+fn animate_lodge_place_pop(
+    time: Res<Time>,
+    mut query: Query<(&mut Transform, &mut LodgePlacePop), With<LodgeTile>>,
+) {
+    let dt = time.delta_secs();
+    for (mut transform, mut pop) in &mut query {
+        pop.elapsed += dt;
+        let t = (pop.elapsed / LODGE_PLACE_POP_SECS).min(1.0);
+        transform.scale = lodge_place_pop_transform(t).scale;
     }
 }
 
@@ -2596,23 +3011,197 @@ fn handle_toggle_button(
     }
 }
 
-fn update_hover_panel(
-    hovered: Res<HoveredHex>,
+fn examiner_tile_fields(
+    map: &Map,
+    coord: HexCoord,
+) -> (String, String, String, String, Color) {
+    match map.tile_at(coord) {
+        None => (
+            "Out of map".to_string(),
+            "—".to_string(),
+            format_hover_coord_half("q", Some(coord.q)),
+            format_hover_coord_half("r", Some(coord.r)),
+            Color::srgb(0.35, 0.38, 0.45),
+        ),
+        Some(tile) => (
+            terrain_label(tile.terrain).to_string(),
+            terrain_category(tile.terrain)
+                .map(str::to_string)
+                .unwrap_or_else(|| "Other".to_string()),
+            format_hover_coord_half("q", Some(coord.q)),
+            format_hover_coord_half("r", Some(coord.r)),
+            terrain_swatch_color(tile.terrain),
+        ),
+    }
+}
+
+fn handle_examiner_click(
+    mouse: Res<ButtonInput<MouseButton>>,
+    mode: Res<BuildingPlacementMode>,
+    suppress: Res<LodgePlacementSuppressClick>,
+    lodge_button: Query<&Interaction, With<HuntingLodgeButton>>,
+    window: Query<&Window, With<PrimaryWindow>>,
+    camera: Query<&Transform, With<Camera2d>>,
+    zoom: Res<Zoom>,
+    placed: Res<PlacedLodges>,
+    mut examiner: ResMut<ExaminerSelection>,
+) {
+    if mode.is_placing_lodge() || !mouse.just_pressed(MouseButton::Left) {
+        return;
+    }
+    if suppress.frames > 0 || pointer_over_hunting_lodge_button(lodge_button) {
+        return;
+    }
+    let Some(mouse_pos) = window.single().cursor_position() else {
+        return;
+    };
+    let cam = camera.single();
+    let ws = Vec2::new(window.single().width(), window.single().height());
+    let world = screen_to_world(cam, ws, mouse_pos, zoom.0);
+    let coord = pixel_to_hex(world.x, world.y, HEX_SIZE);
+
+    examiner.0 = Some(
+        placed
+            .lodge_index_at(coord)
+            .map(ExaminerFocus::Building)
+            .unwrap_or(ExaminerFocus::Tile(coord)),
+    );
+}
+
+fn animate_selection_highlight(
+    time: Res<Time>,
+    examiner: Res<ExaminerSelection>,
+    placed: Res<PlacedLodges>,
+    mut mesh_cache: ResMut<SelectionBuildingMeshCache>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<ColorMaterial>>,
+    mut tile_ring: Query<
+        (&mut Transform, &mut Visibility, &MeshMaterial2d<ColorMaterial>),
+        With<SelectionTileRing>,
+    >,
+    mut building_root: Query<
+        (&mut Transform, &mut Visibility),
+        (With<SelectionBuildingRoot>, Without<SelectionTileRing>),
+    >,
+    mut building_fill: Query<
+        &mut Mesh2d,
+        (
+            With<SelectionBuildingFill>,
+            Without<SelectionTileRing>,
+            Without<SelectionBuildingRoot>,
+            Without<SelectionBuildingOutline>,
+        ),
+    >,
+    mut building_outline: Query<
+        (
+            &mut Transform,
+            &mut Mesh2d,
+            &MeshMaterial2d<ColorMaterial>,
+        ),
+        (
+            With<SelectionBuildingOutline>,
+            Without<SelectionTileRing>,
+            Without<SelectionBuildingRoot>,
+            Without<SelectionBuildingFill>,
+        ),
+    >,
+) {
+    let pulse = (time.elapsed_secs() * std::f32::consts::TAU * HOVER_GLOW_PULSE_HZ).sin();
+    let scale = 1.0 + pulse * HOVER_GLOW_PULSE_SCALE;
+    let alpha = HOVER_GLOW_ALPHA_BASE + pulse * HOVER_GLOW_ALPHA_AMP;
+
+    let Ok((mut tile_transform, mut tile_vis, tile_mat)) = tile_ring.get_single_mut() else {
+        return;
+    };
+    let Ok((mut build_transform, mut build_vis)) = building_root.get_single_mut() else {
+        return;
+    };
+
+    match examiner.0 {
+        None => {
+            *tile_vis = Visibility::Hidden;
+            *build_vis = Visibility::Hidden;
+            tile_transform.scale = Vec3::ONE;
+            build_transform.scale = Vec3::ONE;
+            if let Ok((mut outline_tf, _, _)) = building_outline.get_single_mut() {
+                outline_tf.scale = Vec3::ONE;
+            }
+        }
+        Some(ExaminerFocus::Tile(hex)) => {
+            *build_vis = Visibility::Hidden;
+            build_transform.scale = Vec3::ONE;
+            if let Ok((mut outline_tf, _, _)) = building_outline.get_single_mut() {
+                outline_tf.scale = Vec3::ONE;
+            }
+            let (tx, ty) = axial_to_pixel(hex.q, hex.r, HEX_SIZE);
+            tile_transform.translation = Vec3::new(tx, ty, 5.2);
+            tile_transform.scale = Vec3::splat(scale);
+            *tile_vis = Visibility::Visible;
+            if let Some(mat) = materials.get_mut(&tile_mat.0) {
+                mat.color = GOLD.with_alpha(alpha);
+            }
+        }
+        Some(ExaminerFocus::Building(idx)) => {
+            *tile_vis = Visibility::Hidden;
+            tile_transform.scale = Vec3::ONE;
+            let Some(lodge) = placed.lodges.get(idx) else {
+                *build_vis = Visibility::Hidden;
+                return;
+            };
+            if mesh_cache.rotation != Some(lodge.rotation) {
+                let (fill, outline) =
+                    lodge_selection_meshes_for_rotation(&mut meshes, lodge.rotation);
+                mesh_cache.rotation = Some(lodge.rotation);
+                mesh_cache.fill = Some(fill.clone());
+                mesh_cache.outline = Some(outline.clone());
+                if let Ok(mut mesh2d) = building_fill.get_single_mut() {
+                    mesh2d.0 = fill;
+                }
+                if let Ok((_, mut mesh2d, _)) = building_outline.get_single_mut() {
+                    mesh2d.0 = outline;
+                }
+            }
+            let coords = lodge_coords(lodge.anchor, lodge.rotation);
+            let centroid = footprint_mesh::footprint_centroid(&coords, HEX_SIZE);
+            build_transform.translation = Vec3::new(centroid.x, centroid.y, 5.2);
+            build_transform.scale = Vec3::ONE;
+            *build_vis = Visibility::Visible;
+            if let Ok((mut outline_tf, _, mat)) = building_outline.get_single_mut() {
+                outline_tf.scale = Vec3::splat(scale);
+                if let Some(m) = materials.get_mut(&mat.0) {
+                    m.color = GOLD.with_alpha(alpha);
+                }
+            }
+        }
+    }
+}
+
+fn update_examiner_panel(
+    examiner: Res<ExaminerSelection>,
+    placed: Res<PlacedLodges>,
     map: Res<GameMap>,
     mut texts: ParamSet<(
         Query<&mut Text, With<HoverNameText>>,
         Query<&mut Text, With<HoverCategoryText>>,
         Query<&mut Text, With<HoverCoordsQ>>,
         Query<&mut Text, With<HoverCoordsR>>,
+        Query<&mut Text, With<ExaminerBuildingNameText>>,
+        Query<&mut Text, With<ExaminerBuildingFoodText>>,
     )>,
     mut swatch: Query<&mut BackgroundColor, With<HoverSwatch>>,
-    mut hint: Query<&mut Visibility, With<HoverEmptyHint>>,
-    mut prev: Local<Option<HexCoord>>,
+    mut hint: Query<
+        &mut Visibility,
+        (With<HoverEmptyHint>, Without<ExaminerBuildingBlock>),
+    >,
+    mut building_block: Query<
+        (&mut Visibility, &mut Node),
+        (With<ExaminerBuildingBlock>, Without<HoverEmptyHint>),
+    >,
 ) {
-    if *prev == hovered.0 {
+    let building_selected = matches!(examiner.0, Some(ExaminerFocus::Building(_)));
+    if !examiner.is_changed() && !(building_selected && placed.is_changed()) {
         return;
     }
-    *prev = hovered.0;
 
     let Ok(mut swatch) = swatch.get_single_mut() else {
         return;
@@ -2620,42 +3209,60 @@ fn update_hover_panel(
     let Ok(mut hint) = hint.get_single_mut() else {
         return;
     };
-
-    let (name, category, q_coord, r_coord, color, show_hint) = match hovered.0 {
-        None => (
-            "—".to_string(),
-            "—".to_string(),
-            format_hover_coord_half("q", None),
-            format_hover_coord_half("r", None),
-            Color::srgb(0.35, 0.38, 0.45),
-            true,
-        ),
-        Some(coord) => match map.0.tile_at(coord) {
-            None => (
-                "Out of map".to_string(),
-                "—".to_string(),
-                format_hover_coord_half("q", Some(coord.q)),
-                format_hover_coord_half("r", Some(coord.r)),
-                Color::srgb(0.35, 0.38, 0.45),
-                false,
-            ),
-            Some(tile) => (
-                terrain_label(tile.terrain).to_string(),
-                terrain_category(tile.terrain)
-                    .map(str::to_string)
-                    .unwrap_or_else(|| "Other".to_string()),
-                format_hover_coord_half("q", Some(coord.q)),
-                format_hover_coord_half("r", Some(coord.r)),
-                terrain_swatch_color(tile.terrain),
-                false,
-            ),
-        },
+    let Ok((mut block_vis, mut block_node)) = building_block.get_single_mut() else {
+        return;
     };
+
+    let (name, category, q_coord, r_coord, color, show_hint, show_building, building_name, food) =
+        match examiner.0 {
+            None => (
+                "—".to_string(),
+                "—".to_string(),
+                format_hover_coord_half("q", None),
+                format_hover_coord_half("r", None),
+                Color::srgb(0.35, 0.38, 0.45),
+                true,
+                false,
+                String::new(),
+                String::new(),
+            ),
+            Some(ExaminerFocus::Tile(coord)) => {
+                let (n, c, q, r, col) = examiner_tile_fields(&map.0, coord);
+                (n, c, q, r, col, false, false, String::new(), String::new())
+            }
+            Some(ExaminerFocus::Building(idx)) => {
+                let Some(lodge) = placed.lodges.get(idx) else {
+                    return;
+                };
+                let (n, c, q, r, col) = examiner_tile_fields(&map.0, lodge.anchor);
+                (
+                    n,
+                    c,
+                    q,
+                    r,
+                    col,
+                    false,
+                    true,
+                    "Hunting Lodge".to_string(),
+                    lodge.food_stored.to_string(),
+                )
+            }
+        };
 
     *hint = if show_hint {
         Visibility::Visible
     } else {
         Visibility::Hidden
+    };
+    *block_vis = if show_building {
+        Visibility::Visible
+    } else {
+        Visibility::Hidden
+    };
+    block_node.display = if show_building {
+        Display::Flex
+    } else {
+        Display::None
     };
     swatch.0 = color;
 
@@ -2670,6 +3277,12 @@ fn update_hover_panel(
     }
     if let Ok(mut text) = texts.p3().get_single_mut() {
         text.0 = r_coord;
+    }
+    if let Ok(mut text) = texts.p4().get_single_mut() {
+        text.0 = building_name;
+    }
+    if let Ok(mut text) = texts.p5().get_single_mut() {
+        text.0 = food;
     }
 }
 
@@ -2756,7 +3369,7 @@ fn reroll_world(
     mut placement_mode: ResMut<BuildingPlacementMode>,
     mut placed_lodges: ResMut<PlacedLodges>,
 ) {
-    if !keys.just_pressed(KeyCode::KeyR) {
+    if !keys.just_pressed(KeyCode::Backslash) {
         return;
     }
 
