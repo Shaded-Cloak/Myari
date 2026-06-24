@@ -107,6 +107,8 @@ impl TileGen {
 pub struct HexTile {
     pub coord: HexCoord,
     pub terrain: TerrainType,
+    #[serde(default)]
+    pub wildlife: crate::wildlife::WildlifeState,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -120,6 +122,7 @@ impl Map {
     pub fn generate(radius: i32, seed: u64) -> Self {
         let mut map = Self::from_tiles(generate_tiles(radius, seed));
         map.rebuild_index();
+        crate::wildlife::seed_wildlife(&mut map, seed);
         map
     }
 
@@ -137,7 +140,9 @@ impl Map {
         for (i, t) in tiles.iter().enumerate() {
             by_coord.insert(t.coord, i);
         }
-        Self { tiles, by_coord }
+        let mut map = Self { tiles, by_coord };
+        crate::wildlife::normalize_wildlife(&mut map);
+        map
     }
 
     pub fn tile_at(&self, coord: HexCoord) -> Option<&HexTile> {
@@ -145,6 +150,12 @@ impl Map {
             .get(&coord)
             .and_then(|&idx| self.tiles.get(idx))
     }
+
+    pub fn tile_at_mut(&mut self, coord: HexCoord) -> Option<&mut HexTile> {
+        let idx = *self.by_coord.get(&coord)?;
+        self.tiles.get_mut(idx)
+    }
+
 }
 
 /// Dense `(q, r) -> tile index` table. Replaces `HashMap<HexCoord, usize>`
@@ -248,6 +259,7 @@ fn generate_tiles(radius: i32, seed: u64) -> Vec<HexTile> {
         .map(|t| HexTile {
             coord: t.coord,
             terrain: t.terrain,
+            wildlife: crate::wildlife::WildlifeState::None,
         })
         .collect();
 

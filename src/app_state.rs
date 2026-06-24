@@ -30,6 +30,8 @@ pub struct LoadingProgress {
     pub status: String,
     pub work_done: bool,
     pub ui_done: bool,
+    /// Turn counter to show on the HUD after step 1 inserts `GameState`.
+    pub loaded_turn: i32,
 }
 
 impl LoadingProgress {
@@ -48,6 +50,7 @@ impl LoadingProgress {
             status: status.to_string(),
             work_done: false,
             ui_done: false,
+            loaded_turn: 1_i32,
         }
     }
 }

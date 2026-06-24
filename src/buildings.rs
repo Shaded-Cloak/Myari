@@ -1,10 +1,12 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use bevy::prelude::Resource;
 use hexx::Hex;
 
-use crate::hexgrid::HexCoord;
+use crate::hexgrid::{hex_disk, HexCoord};
 use crate::map::{is_water, Map, TerrainType};
+
+pub const HUNTING_ASSIGN_RANGE: i32 = 5;
 
 #[derive(Debug, Clone)]
 pub struct PlacedLodge {
@@ -35,6 +37,26 @@ impl PlacedLodges {
     pub fn lodge_index_at(&self, coord: HexCoord) -> Option<usize> {
         self.occupied.get(&coord).copied()
     }
+
+    pub fn footprint_hexes(&self, lodge_idx: usize) -> [HexCoord; 4] {
+        let lodge = &self.lodges[lodge_idx];
+        lodge_coords(lodge.anchor, lodge.rotation)
+    }
+
+    pub fn is_on_own_footprint(&self, lodge_idx: usize, coord: HexCoord) -> bool {
+        self.footprint_hexes(lodge_idx).contains(&coord)
+    }
+}
+
+/// All map coords within hunt range of any footprint hex of this lodge.
+pub fn coords_in_lodge_hunt_range(lodge: &PlacedLodge) -> HashSet<HexCoord> {
+    let mut out = HashSet::new();
+    for foot in lodge_coords(lodge.anchor, lodge.rotation) {
+        for offset in hex_disk(HUNTING_ASSIGN_RANGE) {
+            out.insert(HexCoord::new(foot.q + offset.q, foot.r + offset.r));
+        }
+    }
+    out
 }
 
 /// Axial offsets from the anchor hex (bottom-left of the 4-hex sketch; hover hex while placing).

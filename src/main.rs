@@ -3,10 +3,12 @@ mod buildings;
 mod footprint_mesh;
 mod game;
 mod hexgrid;
+mod hunters;
 mod map;
 mod outer_islands;
 mod rng;
 mod ui;
+mod wildlife;
 
 use app_state::{AppState, InGameHud, LoadingJob, LoadingProgress};
 use bevy::hierarchy::Parent;
@@ -24,6 +26,8 @@ use rand::Rng;
 use std::collections::{HashMap, HashSet};
 
 use buildings::{can_place_lodge, lodge_coords, PlacedLodges};
+use hunters::{spawn_hunters_for_lodge, Hunters, hunters_turn_tick};
+use wildlife::{examiner_game_line, game_stock, normalize_wildlife, wildlife_turn_tick};
 use game::GameState;
 use crate::hexgrid::{axial_to_pixel, hex_corners_at, hex_corners_local, hex_world_bounds, pixel_to_hex, HexCoord};
 use map::{Map, HexTile, TerrainType, MAP_RADIUS};
@@ -35,10 +39,11 @@ use ui::{
     spawn_ornate_divider, spawn_star_watermark, title_menu::{
         self, spawn_title_menu, sync_title_subscreen, TitleRoot, TitleScreen,
     },
-    apply_menu_fade_alpha, ease_out_cubic, smooth_follow_vec2_distance_speed, BlocksWorldInput, HudAnchor,
+    apply_menu_fade_alpha, ease_out_cubic,
+    BlocksWorldInput, HudAnchor,
     MenuButton, MenuButtonFill, MenuFadeLayer,
     UiTheme, BTN_HOVER, BTN_IDLE, BTN_PRESSED,
-    CREAM, GOLD, HINT, MENU_ENTER_SECS, MENU_EXIT_SECS, MENU_SWITCH_SECS,
+    CREAM, GOLD, HINT,
     GLOBAL_Z_HUD, GLOBAL_Z_MENU_PANEL, PAUSE_WORLD_DIM_ALPHA,
 };
 
@@ -51,20 +56,13 @@ const LOAD_UI_SECS: f32 = 0.45;
 const HOVER_OUTLINE_STROKE: f32 = 2.2;
 /// Map border thickness in world units — scales with the map when zooming.
 const MAP_BORDER_STROKE: f32 = 24.0;
-/// Slow drift onto the hovered tile; ramps up when the cursor skips ahead.
-const HOVER_GLOW_SPEED_NEAR: f32 = 7.5;
-const HOVER_GLOW_SPEED_FAR: f32 = 16.0;
-/// Full alpha/scale pulse cycle (~2.8s).
-const HOVER_GLOW_PULSE_HZ: f32 = 0.36;
-const HOVER_GLOW_PULSE_SCALE: f32 = 0.032;
-const HOVER_GLOW_ALPHA_BASE: f32 = 0.84;
-const HOVER_GLOW_ALPHA_AMP: f32 = 0.12;
+const HOVER_GLOW_ALPHA: f32 = 0.84;
 /// Extra margin so the map isn't flush against the screen edge.
 const MAP_CAMERA_PADDING: f32 = 1.06;
 /// Grid fully visible when hex height on screen is at least this many pixels.
-const GRID_HEX_PX_FADE_START: f32 = 28.0;
-/// Grid hidden when hex height on screen is at or below this (only at extreme zoom-out).
-const GRID_HEX_PX_FADE_END: f32 = 7.0;
+const GRID_HEX_PX_FADE_START: f32 = 36.0;
+/// Grid hidden when hex height on screen is at or below this (moderate zoom-out).
+const GRID_HEX_PX_FADE_END: f32 = 22.0;
 /// Placed lodge inset fill (opaque; same hue as blueprint).
 const LODGE_BUILDING_FILL: Color = Color::srgb(0.45, 0.28, 0.12);
 /// Selection highlight fill — blueprint look, fully opaque.
@@ -74,8 +72,12 @@ const LODGE_BLUEPRINT_STROKE_VALID: Color = Color::srgba(0.85, 0.72, 0.35, 0.9);
 const LODGE_BLUEPRINT_STROKE_INVALID: Color = Color::srgba(0.05, 0.05, 0.05, 0.95);
 /// Terrain margin around building fill (constant-distance inset from footprint boundary).
 const LODGE_BUILDING_MARGIN: f32 = 7.0;
-const LODGE_PLACE_START_SCALE: f32 = 0.2;
-const LODGE_PLACE_POP_SECS: f32 = 0.48;
+/// Gold dots on forest tiles — count matches game stock (1–3).
+const GAME_DOT_RADIUS: f32 = 5.0;
+const GAME_DOT_Z: f32 = 4.65;
+/// Center-to-center half-span for multi-dot layouts (pair at ±spread, trio on equilateral triangle).
+const GAME_DOT_SPREAD: f32 = 8.5;
+const GAME_DOT_COLOR: Color = Color::srgb(0.92, 0.78, 0.35);
 
 fn main() {
     println!("Myari starting up...");
@@ -94,12 +96,14 @@ fn main() {
         .init_resource::<HoveredHex>()
         .init_resource::<BuildingPlacementMode>()
         .init_resource::<PlacedLodges>()
+        .init_resource::<Hunters>()
         .init_resource::<ExaminerSelection>()
         .init_resource::<LodgePlacementRotation>()
         .init_resource::<LodgeBlueprintMeshCache>()
         .init_resource::<LodgePlacementSuppressClick>()
         .init_resource::<FpsCounter>()
         .init_resource::<GridVisible>()
+        .init_resource::<GameVisible>()
         .init_resource::<MenuScreen>()
         .init_resource::<MenuScreenEpoch>()
         .init_resource::<MenuMotion>()
@@ -183,7 +187,9 @@ fn main() {
                 track_hover,
                 animate_hover_highlight,
                 update_examiner_panel,
+                update_examiner_building_texts,
                 handle_examiner_click,
+                sync_hunter_markers,
                 animate_selection_highlight,
                 handle_selection,
                 move_selected_unit,
@@ -193,18 +199,30 @@ fn main() {
                 on_menu_screen_changed,
                 handle_quit_to_main_menu_button,
                 style_menu_buttons,
-                (handle_toggle_button, sync_grid_for_zoom).chain(),
+                handle_toggle_button,
             )
                 .run_if(in_state(AppState::InGame)),
         )
         .add_systems(
             Update,
             (
+                sync_grid_for_zoom,
                 fps_update,
                 end_turn,
-                reroll_world,
                 save_game,
                 load_game,
+                handle_game_toggle_button,
+            )
+                .run_if(in_state(AppState::InGame)),
+        )
+        .add_systems(
+            Update,
+            sync_game_stock_markers.run_if(in_state(AppState::InGame)),
+        )
+        .add_systems(
+            Update,
+            (
+                reroll_world,
                 animate_lodge_blueprint,
                 handle_hunting_lodge_button,
                 sync_hunting_lodge_toolbar,
@@ -212,7 +230,6 @@ fn main() {
                 handle_lodge_placement_click,
                 cancel_lodge_placement_on_escape,
                 tick_lodge_placement_suppress,
-                animate_lodge_place_pop,
             )
                 .run_if(in_state(AppState::InGame)),
         )
@@ -426,11 +443,6 @@ struct LodgeBlueprintOutline;
 #[derive(Component)]
 struct LodgeTile;
 
-#[derive(Component)]
-struct LodgePlacePop {
-    elapsed: f32,
-}
-
 #[derive(Resource, Default)]
 struct FpsCounter {
     elapsed: f32,
@@ -531,6 +543,27 @@ pub struct GridToggle;
 #[derive(Component)]
 pub struct GridToggleLabel;
 
+#[derive(Resource, Default)]
+pub struct GameVisible(pub bool);
+
+#[derive(Resource, Clone)]
+struct GameLabelFont(Handle<Font>);
+
+#[derive(Component)]
+pub struct GameToggle;
+
+#[derive(Component)]
+pub struct GameToggleLabel;
+
+#[derive(Component)]
+struct GameStockMarker {
+    coord: HexCoord,
+    stock: u8,
+}
+
+#[derive(Component)]
+struct GameStockDot;
+
 #[derive(Component)]
 struct GridMarker;
 
@@ -586,6 +619,23 @@ struct ExaminerBuildingNameText;
 struct ExaminerBuildingFoodText;
 
 #[derive(Component)]
+struct ExaminerBuildingHuntersText;
+
+#[derive(Component)]
+struct ExaminerBuildingStatusText;
+
+#[derive(Component)]
+struct HoverGameText;
+
+#[derive(Component)]
+struct HunterMarker {
+    hunter_idx: usize,
+}
+
+const HUNTER_MARKER_Z: f32 = 4.85;
+const HUNTER_COLOR: Color = Color::srgb(0.92, 0.78, 0.35);
+
+#[derive(Component)]
 struct SelectionTileRing;
 
 #[derive(Component)]
@@ -609,7 +659,9 @@ struct SavePath(Option<String>);
 // ── Startup ─────────────────────────────────────────────────────
 
 fn setup_ui_theme(mut commands: Commands, asset_server: Res<AssetServer>) {
-    commands.insert_resource(UiTheme::load(&asset_server));
+    let theme = UiTheme::load(&asset_server);
+    commands.insert_resource(GameLabelFont(theme.font.clone()));
+    commands.insert_resource(theme);
 }
 
 fn setup_camera(mut commands: Commands) {
@@ -717,6 +769,7 @@ fn reset_lodge_placement_on_session(
     mut mode: ResMut<BuildingPlacementMode>,
     mut rotation: ResMut<LodgePlacementRotation>,
     mut placed: ResMut<PlacedLodges>,
+    mut hunters: ResMut<Hunters>,
     mut mesh_cache: ResMut<LodgeBlueprintMeshCache>,
     mut suppress: ResMut<LodgePlacementSuppressClick>,
     mut examiner: ResMut<ExaminerSelection>,
@@ -726,6 +779,7 @@ fn reset_lodge_placement_on_session(
     *mode = BuildingPlacementMode::Idle;
     rotation.0 = 0;
     *placed = PlacedLodges::default();
+    hunters.clear();
     mesh_cache.rotation = None;
     suppress.frames = 0;
     examiner.0 = match *state.get() {
@@ -880,7 +934,6 @@ fn loading_pipeline(
     mut seed_res: ResMut<CurrentSeed>,
     theme: Res<UiTheme>,
     mut ui_ready: ResMut<InGameUiReady>,
-    game_state: Option<Res<GameState>>,
     window: Query<&Window, With<PrimaryWindow>>,
     mut cameras: Query<(&mut Transform, &mut OrthographicProjection), With<Camera2d>>,
     mut zoom: ResMut<Zoom>,
@@ -888,6 +941,7 @@ fn loading_pipeline(
         Query<&mut Text, With<TurnText>>,
         Query<&mut Text, With<SeedText>>,
     )>,
+    game_font: Res<GameLabelFont>,
 ) {
     progress.timer += time.delta_secs();
     progress.phase_timer += time.delta_secs();
@@ -931,7 +985,15 @@ fn loading_pipeline(
                 };
 
                 seed_res.0 = seed;
-                spawn_world_visuals(&mut commands, &mut meshes, &mut materials, &map, &gs);
+                spawn_world_visuals(
+                    &mut commands,
+                    &mut meshes,
+                    &mut materials,
+                    &map,
+                    &gs,
+                    &game_font,
+                    false,
+                );
                 if let Ok(window) = window.get_single() {
                     let window_size = Vec2::new(window.width(), window.height());
                     if window_size.x > 0.0 && window_size.y > 0.0 {
@@ -946,6 +1008,7 @@ fn loading_pipeline(
                         }
                     }
                 }
+                progress.loaded_turn = gs.turn;
                 commands.insert_resource(GameMap(map));
                 commands.insert_resource(gs);
                 progress.work_done = true;
@@ -1039,10 +1102,8 @@ fn loading_pipeline(
                     ui_ready.0 = true;
                 }
 
-                if let Some(gs) = game_state.as_ref() {
-                    if let Ok(mut text) = text_queries.p0().get_single_mut() {
-                        text.0 = gs.turn.to_string();
-                    }
+                if let Ok(mut text) = text_queries.p0().get_single_mut() {
+                    text.0 = progress.loaded_turn.to_string();
                 }
                 if let Ok(mut text) = text_queries.p1().get_single_mut() {
                     text.0 = seed_res.0.to_string();
@@ -1141,6 +1202,18 @@ fn spawn_game_hud(commands: &mut Commands, theme: &UiTheme, seed: u64) {
             panel.spawn(theme.label("SEED"));
             panel.spawn((theme.value(seed.to_string(), 15.0), SeedText));
             panel.spawn(theme.hint("Press \\ to reroll world", 11.0));
+            spawn_ornate_divider(panel, theme, false);
+            panel
+                .spawn((
+                    menu_button_row_bundle(),
+                    MenuButton,
+                    GameToggle,
+                    BlocksWorldInput,
+                    FocusPolicy::Block,
+                ))
+                .with_children(|btn| {
+                    spawn_menu_button_label(btn, theme, "Game: OFF", GameToggleLabel);
+                });
         },
     );
 }
@@ -1192,6 +1265,20 @@ fn spawn_hover_panel(commands: &mut Commands, theme: &UiTheme, images: &mut Asse
                 .spawn((
                     Node {
                         width: Val::Percent(100.0),
+                        flex_direction: FlexDirection::Column,
+                        row_gap: Val::Px(5.0),
+                        ..default()
+                    },
+                ))
+                .with_children(|block| {
+                    block.spawn(theme.label("GAME"));
+                    block.spawn((theme.value("—", 19.0), HoverGameText));
+                });
+
+            panel
+                .spawn((
+                    Node {
+                        width: Val::Percent(100.0),
                         display: Display::None,
                         ..default()
                     },
@@ -1219,6 +1306,10 @@ fn spawn_hover_panel(commands: &mut Commands, theme: &UiTheme, images: &mut Asse
                     block.spawn((theme.value("—", 22.0), ExaminerBuildingNameText));
                     block.spawn(theme.label("FOOD STORED"));
                     block.spawn((theme.value("—", 19.0), ExaminerBuildingFoodText));
+                    block.spawn(theme.label("HUNTERS"));
+                    block.spawn((theme.value("—", 19.0), ExaminerBuildingHuntersText));
+                    block.spawn(theme.label("STATUS"));
+                    block.spawn((theme.value("—", 19.0), ExaminerBuildingStatusText));
                 });
 
             panel
@@ -1338,7 +1429,6 @@ fn load_game(
     mut gs: ResMut<GameState>,
     mut game_map: ResMut<GameMap>,
     mut seed_res: ResMut<CurrentSeed>,
-    mut zoom: ResMut<Zoom>,
     window: Query<&Window, With<PrimaryWindow>>,
     mut cameras: Query<(&mut Transform, &mut OrthographicProjection), With<Camera2d>>,
     mut text_queries: ParamSet<(
@@ -1348,6 +1438,8 @@ fn load_game(
     world_entities: Query<Entity, With<WorldEntity>>,
     mut placement_mode: ResMut<BuildingPlacementMode>,
     mut placed_lodges: ResMut<PlacedLodges>,
+    mut hunters: ResMut<Hunters>,
+    game_font: Res<GameLabelFont>,
 ) {
     if !keys.just_pressed(KeyCode::F9) {
         return;
@@ -1363,23 +1455,34 @@ fn load_game(
 
     *placement_mode = BuildingPlacementMode::Idle;
     *placed_lodges = PlacedLodges::default();
+    hunters.clear();
 
     seed_res.0 = data.seed;
-    let map = Map::from_tiles(data.tiles);
+    let mut map = Map::from_tiles(data.tiles);
+    normalize_wildlife(&mut map);
     *gs = data.game_state;
-    spawn_world_visuals(&mut commands, &mut meshes, &mut materials, &map, &gs);
+    spawn_world_visuals(
+        &mut commands,
+        &mut meshes,
+        &mut materials,
+        &map,
+        &gs,
+        &game_font,
+        false,
+    );
     game_map.0 = map;
 
     if let Ok(window) = window.get_single() {
         let window_size = Vec2::new(window.width(), window.height());
         if window_size.x > 0.0 && window_size.y > 0.0 {
             if let Ok((mut transform, mut projection)) = cameras.get_single_mut() {
+                let mut zoom_out = 0.0_f32;
                 apply_camera_frame_to_tiles(
                     &game_map.0.tiles,
                     window_size,
                     &mut transform,
                     &mut projection,
-                    &mut zoom.0,
+                    &mut zoom_out,
                 );
             }
         }
@@ -1400,6 +1503,8 @@ fn spawn_world_visuals(
     materials: &mut ResMut<Assets<ColorMaterial>>,
     map: &Map,
     gs: &GameState,
+    _game_font: &GameLabelFont,
+    game_labels_visible: bool,
 ) {
     let map_mesh = meshes.add(make_combined_hex_mesh(&map.tiles, HEX_SIZE));
     commands.spawn((
@@ -1439,10 +1544,242 @@ fn spawn_world_visuals(
         WorldEntity,
     ));
 
+    spawn_game_stock_markers(
+        commands,
+        meshes,
+        materials,
+        map,
+        game_labels_visible,
+    );
+
     // Civilization city/unit markers temporarily disabled — game state still
     // tracks them, but we don't draw the red/blue/green dots yet.
     // spawn_civ_markers(commands, meshes, materials, gs);
-    let _ = (commands, meshes, materials, gs);
+    let _ = gs;
+}
+
+fn game_dot_offsets(stock: u8) -> &'static [(f32, f32)] {
+    match stock {
+        1 => &[(0.0, 0.0)],
+        2 => &[(-GAME_DOT_SPREAD, 0.0), (GAME_DOT_SPREAD, 0.0)],
+        3 => &[
+            (0.0, GAME_DOT_SPREAD * 0.866),
+            (-GAME_DOT_SPREAD * 0.866, -GAME_DOT_SPREAD * 0.5),
+            (GAME_DOT_SPREAD * 0.866, -GAME_DOT_SPREAD * 0.5),
+        ],
+        _ => &[],
+    }
+}
+
+fn spawn_game_stock_marker(
+    commands: &mut Commands,
+    mesh: &Handle<Mesh>,
+    material: &Handle<ColorMaterial>,
+    coord: HexCoord,
+    stock: u8,
+    visible: bool,
+) {
+    let (x, y) = axial_to_pixel(coord.q, coord.r, HEX_SIZE);
+    let visibility = if visible {
+        Visibility::Visible
+    } else {
+        Visibility::Hidden
+    };
+    commands
+        .spawn((
+            Transform::from_xyz(x, y, GAME_DOT_Z),
+            visibility,
+            GameStockMarker { coord, stock },
+            WorldEntity,
+        ))
+        .with_children(|root| {
+            for &(ox, oy) in game_dot_offsets(stock) {
+                root.spawn((
+                    Mesh2d(mesh.clone()),
+                    MeshMaterial2d(material.clone()),
+                    Transform::from_xyz(ox, oy, 0.0),
+                    GameStockDot,
+                ));
+            }
+        });
+}
+
+fn spawn_game_stock_markers(
+    commands: &mut Commands,
+    meshes: &mut Assets<Mesh>,
+    materials: &mut Assets<ColorMaterial>,
+    map: &Map,
+    visible: bool,
+) {
+    let mesh = meshes.add(Circle::new(GAME_DOT_RADIUS));
+    let material = materials.add(ColorMaterial::from_color(GAME_DOT_COLOR));
+    for tile in &map.tiles {
+        let Some(stock) = game_stock(tile.wildlife) else {
+            continue;
+        };
+        spawn_game_stock_marker(
+            commands,
+            &mesh,
+            &material,
+            tile.coord,
+            stock,
+            visible,
+        );
+    }
+}
+
+fn rebuild_game_stock_marker_dots(
+    commands: &mut Commands,
+    entity: Entity,
+    stock: u8,
+    mesh: &Handle<Mesh>,
+    material: &Handle<ColorMaterial>,
+    children_q: &Query<&Children>,
+) {
+    clear_game_stock_label_children(commands, entity, children_q);
+    commands.entity(entity).with_children(|root| {
+        for &(ox, oy) in game_dot_offsets(stock) {
+            root.spawn((
+                Mesh2d(mesh.clone()),
+                MeshMaterial2d(material.clone()),
+                Transform::from_xyz(ox, oy, 0.0),
+                GameStockDot,
+            ));
+        }
+    });
+}
+
+fn clear_game_stock_label_children(
+    commands: &mut Commands,
+    root: Entity,
+    children_q: &Query<&Children>,
+) {
+    let Ok(children) = children_q.get(root) else {
+        return;
+    };
+    for child in children.iter() {
+        commands.entity(*child).despawn_recursive();
+    }
+}
+
+fn game_markers_shown(game_visible: bool, zoom_scale: f32) -> bool {
+    game_visible && grid_alpha_for_scale(zoom_scale) > 0.001
+}
+
+fn sync_game_stock_markers(
+    mut commands: Commands,
+    zoom: Res<Zoom>,
+    game_visible: Res<GameVisible>,
+    map: Res<GameMap>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<ColorMaterial>>,
+    mut markers: Query<(Entity, &mut GameStockMarker, &mut Visibility)>,
+    children_q: Query<&Children>,
+) {
+    if !map.is_changed() && !game_visible.is_changed() && !zoom.is_changed() {
+        return;
+    }
+
+    let show_layer = game_markers_shown(game_visible.0, zoom.0);
+    let map_dirty = map.is_changed();
+    let mut dot_mesh: Option<Handle<Mesh>> = None;
+    let mut dot_mat: Option<Handle<ColorMaterial>> = None;
+    let mut seen = HashSet::new();
+    let mut despawn = Vec::new();
+
+    for (entity, mut marker, mut visibility) in &mut markers {
+        seen.insert(marker.coord);
+        let stock = map
+            .0
+            .tile_at(marker.coord)
+            .and_then(|t| game_stock(t.wildlife));
+        let visible = show_layer && stock.is_some();
+        *visibility = if visible {
+            Visibility::Visible
+        } else {
+            Visibility::Hidden
+        };
+        if !map_dirty {
+            continue;
+        }
+        if stock.is_none() {
+            despawn.push(entity);
+            continue;
+        }
+        let Some(s) = stock else {
+            continue;
+        };
+        if marker.stock != s {
+            marker.stock = s;
+            if dot_mesh.is_none() {
+                dot_mesh = Some(meshes.add(Circle::new(GAME_DOT_RADIUS)));
+                dot_mat = Some(materials.add(ColorMaterial::from_color(GAME_DOT_COLOR)));
+            }
+            rebuild_game_stock_marker_dots(
+                &mut commands,
+                entity,
+                s,
+                dot_mesh.as_ref().unwrap(),
+                dot_mat.as_ref().unwrap(),
+                &children_q,
+            );
+        }
+    }
+
+    for entity in despawn {
+        commands.entity(entity).despawn_recursive();
+    }
+
+    if !map_dirty {
+        return;
+    }
+
+    if dot_mesh.is_none() {
+        dot_mesh = Some(meshes.add(Circle::new(GAME_DOT_RADIUS)));
+        dot_mat = Some(materials.add(ColorMaterial::from_color(GAME_DOT_COLOR)));
+    }
+    let mesh = dot_mesh.unwrap();
+    let material = dot_mat.unwrap();
+
+    for tile in &map.0.tiles {
+        let Some(stock) = game_stock(tile.wildlife) else {
+            continue;
+        };
+        if seen.contains(&tile.coord) {
+            continue;
+        }
+        spawn_game_stock_marker(
+            &mut commands,
+            &mesh,
+            &material,
+            tile.coord,
+            stock,
+            show_layer,
+        );
+    }
+}
+
+fn handle_game_toggle_button(
+    mut interaction_query: Query<
+        &Interaction,
+        (Changed<Interaction>, With<GameToggle>),
+    >,
+    mut game_visible: ResMut<GameVisible>,
+    mut label_query: Query<&mut Text, With<GameToggleLabel>>,
+) {
+    for interaction in &mut interaction_query {
+        if *interaction != Interaction::Pressed {
+            continue;
+        }
+        game_visible.0 = !game_visible.0;
+        for mut text in &mut label_query {
+            text.0 = if game_visible.0 {
+                "Game: ON".to_string()
+            } else {
+                "Game: OFF".to_string()
+            };
+        }
+    }
 }
 
 fn spawn_pause_world_dim(
@@ -1529,10 +1866,20 @@ fn spawn_world_entities(
     meshes: &mut ResMut<Assets<Mesh>>,
     materials: &mut ResMut<Assets<ColorMaterial>>,
     seed: u64,
+    game_font: &GameLabelFont,
+    game_labels_visible: bool,
 ) -> (Map, GameState) {
     let map = Map::generate(MAP_RADIUS, seed);
     let gs = GameState::new(&map);
-    spawn_world_visuals(commands, meshes, materials, &map, &gs);
+    spawn_world_visuals(
+        commands,
+        meshes,
+        materials,
+        &map,
+        &gs,
+        game_font,
+        game_labels_visible,
+    );
     (map, gs)
 }
 
@@ -1934,6 +2281,51 @@ fn terrain_to_color(t: TerrainType) -> Color {
     }
 }
 
+/// Gold stroke on dark terrain (lighter for contrast).
+const ADAPTIVE_GOLD_STROKE_LIGHT: Color = Color::srgb(0.94, 0.82, 0.50);
+/// Gold stroke on bright terrain (darker for contrast).
+const ADAPTIVE_GOLD_STROKE_DARK: Color = Color::srgb(0.42, 0.30, 0.08);
+
+fn terrain_luminance(terrain: TerrainType) -> f32 {
+    let c = terrain_to_color(terrain).to_srgba();
+    (0.299 * c.red + 0.587 * c.green + 0.114 * c.blue).clamp(0.0, 1.0)
+}
+
+fn tile_luminance(map: &Map, coord: HexCoord) -> f32 {
+    map.tile_at(coord)
+        .map(|t| terrain_luminance(t.terrain))
+        .unwrap_or(0.45)
+}
+
+fn footprint_luminance(map: &Map, coords: &[HexCoord]) -> f32 {
+    let mut sum = 0.0f32;
+    let mut count = 0u32;
+    for &coord in coords {
+        if let Some(tile) = map.tile_at(coord) {
+            sum += terrain_luminance(tile.terrain);
+            count += 1;
+        }
+    }
+    if count == 0 {
+        0.45
+    } else {
+        sum / count as f32
+    }
+}
+
+fn adaptive_gold_stroke(luminance: f32, alpha: f32) -> Color {
+    let t = (1.0 - luminance.clamp(0.0, 1.0)).clamp(0.0, 1.0);
+    let dark = ADAPTIVE_GOLD_STROKE_DARK.to_srgba();
+    let light = ADAPTIVE_GOLD_STROKE_LIGHT.to_srgba();
+    let lerp = |a: f32, b: f32| a + (b - a) * t;
+    Color::srgba(
+        lerp(dark.red, light.red),
+        lerp(dark.green, light.green),
+        lerp(dark.blue, light.blue),
+        alpha,
+    )
+}
+
 // ── Hover (cheap: single entity, no material mutation) ──────────
 
 fn screen_to_world(cam: &Transform, window_size: Vec2, screen_pos: Vec2, zoom: f32) -> Vec2 {
@@ -2005,8 +2397,8 @@ fn track_hover(
 }
 
 fn animate_hover_highlight(
-    time: Res<Time>,
     mode: Res<BuildingPlacementMode>,
+    map: Res<GameMap>,
     hovered: Res<HoveredHex>,
     examiner: Res<ExaminerSelection>,
     placed: Res<PlacedLodges>,
@@ -2036,39 +2428,16 @@ fn animate_hover_highlight(
     };
 
     let (tx, ty) = axial_to_pixel(hex.q, hex.r, HEX_SIZE);
-    let target = Vec2::new(tx, ty);
-    let dt = time.delta_secs();
-    let suppressed = hover_suppressed_for_selected_building(&examiner, &placed, hex);
+    transform.translation = Vec3::new(tx, ty, 5.0);
+    transform.scale = Vec3::ONE;
 
-    let current = transform.translation.truncate();
-    let pos = smooth_follow_vec2_distance_speed(
-        current,
-        target,
-        dt,
-        HOVER_GLOW_SPEED_NEAR,
-        HOVER_GLOW_SPEED_FAR,
-        HEX_SIZE * 0.35,
-        HEX_SIZE * 2.8,
-    );
-    transform.translation = Vec3::new(pos.x, pos.y, 5.0);
-
-    if suppressed {
-        let arrived = pos.distance_squared(target) < (HEX_SIZE * 0.12).powi(2);
-        if arrived || *visibility == Visibility::Hidden {
-            *visibility = Visibility::Hidden;
-            transform.scale = Vec3::ONE;
-            return;
-        }
-        // Still sliding onto a selected-building tile — keep visible until we arrive.
-    } else if *visibility == Visibility::Hidden {
-        transform.scale = Vec3::ONE;
+    if hover_suppressed_for_selected_building(&examiner, &placed, hex) {
+        *visibility = Visibility::Hidden;
+        return;
     }
 
-    let pulse = (time.elapsed_secs() * std::f32::consts::TAU * HOVER_GLOW_PULSE_HZ).sin();
-    transform.scale = Vec3::splat(1.0 + pulse * HOVER_GLOW_PULSE_SCALE);
     if let Some(mat) = materials.get_mut(&material.0) {
-        let alpha = HOVER_GLOW_ALPHA_BASE + pulse * HOVER_GLOW_ALPHA_AMP;
-        mat.color = GOLD.with_alpha(alpha);
+        mat.color = adaptive_gold_stroke(tile_luminance(&map.0, hex), HOVER_GLOW_ALPHA);
     }
     *visibility = Visibility::Visible;
 }
@@ -2173,7 +2542,6 @@ fn handle_lodge_rotate(
 }
 
 fn animate_lodge_blueprint(
-    time: Res<Time>,
     mode: Res<BuildingPlacementMode>,
     hovered: Res<HoveredHex>,
     rotation: Res<LodgePlacementRotation>,
@@ -2227,45 +2595,25 @@ fn animate_lodge_blueprint(
     let coords = lodge_coords(center, rotation.0);
     let valid = can_place_lodge(&map.0, &*placed, center, rotation.0);
     let centroid = footprint_mesh::footprint_centroid(&coords, HEX_SIZE);
-    let target = Vec2::new(centroid.x, centroid.y);
-    let dt = time.delta_secs();
+    root_transform.translation = Vec3::new(centroid.x, centroid.y, 5.0);
+    root_transform.scale = Vec3::ONE;
+    *root_visibility = Visibility::Visible;
 
-    if *root_visibility == Visibility::Hidden {
-        root_transform.translation = Vec3::new(target.x, target.y, 5.0);
-        root_transform.scale = Vec3::ONE;
-        *root_visibility = Visibility::Visible;
-    } else {
-        let current = root_transform.translation.truncate();
-        let pos = smooth_follow_vec2_distance_speed(
-            current,
-            target,
-            dt,
-            HOVER_GLOW_SPEED_NEAR,
-            HOVER_GLOW_SPEED_FAR,
-            HEX_SIZE * 0.35,
-            HEX_SIZE * 2.8,
-        );
-        root_transform.translation = Vec3::new(pos.x, pos.y, 5.0);
-    }
-
-    let pulse = (time.elapsed_secs() * std::f32::consts::TAU * HOVER_GLOW_PULSE_HZ).sin();
-    root_transform.scale = Vec3::splat(1.0 + pulse * HOVER_GLOW_PULSE_SCALE);
-
-    let stroke_color = if valid {
-        LODGE_BLUEPRINT_STROKE_VALID
-    } else {
-        LODGE_BLUEPRINT_STROKE_INVALID
-    };
-    let stroke_alpha = HOVER_GLOW_ALPHA_BASE + pulse * HOVER_GLOW_ALPHA_AMP;
     if let Ok((_, mat)) = outline.get_single() {
         if let Some(m) = materials.get_mut(&mat.0) {
-            m.color = stroke_color.with_alpha(stroke_alpha);
+            let color = if valid {
+                let coords = lodge_coords(center, rotation.0);
+                adaptive_gold_stroke(footprint_luminance(&map.0, &coords), HOVER_GLOW_ALPHA)
+            } else {
+                LODGE_BLUEPRINT_STROKE_INVALID.with_alpha(HOVER_GLOW_ALPHA)
+            };
+            m.color = color;
         }
     }
     if let Ok((_, mat)) = fill.get_single() {
         if let Some(m) = materials.get_mut(&mat.0) {
             let mut c = LODGE_BLUEPRINT_FILL;
-            c = c.with_alpha(LODGE_BLUEPRINT_FILL.alpha() * (0.92 + pulse * 0.06));
+            c = c.with_alpha(LODGE_BLUEPRINT_FILL.alpha() * 0.92);
             m.color = c;
         }
     }
@@ -2282,6 +2630,7 @@ fn handle_lodge_placement_click(
     rotation: Res<LodgePlacementRotation>,
     map: Res<GameMap>,
     mut placed: ResMut<PlacedLodges>,
+    mut hunters: ResMut<Hunters>,
     mut mode: ResMut<BuildingPlacementMode>,
     mut mesh_cache: ResMut<LodgeBlueprintMeshCache>,
     mut commands: Commands,
@@ -2310,8 +2659,59 @@ fn handle_lodge_placement_click(
         center,
         rotation.0,
     );
+    let lodge_idx = placed.lodges.len();
     placed.register_lodge(center, rotation.0);
+    spawn_hunters_for_lodge(&mut hunters, &map.0, &placed, lodge_idx);
+    spawn_hunter_markers(
+        &mut commands,
+        &mut meshes,
+        &mut materials,
+        &hunters,
+        lodge_idx,
+    );
     cancel_lodge_placement(&mut mode, &mut mesh_cache);
+}
+
+fn spawn_hunter_markers(
+    commands: &mut Commands,
+    meshes: &mut ResMut<Assets<Mesh>>,
+    materials: &mut ResMut<Assets<ColorMaterial>>,
+    hunters: &Hunters,
+    lodge_idx: usize,
+) {
+    let mesh = meshes.add(Circle::new(6.0));
+    let mat = materials.add(ColorMaterial::from_color(HUNTER_COLOR));
+    for (i, h) in hunters
+        .hunters
+        .iter()
+        .enumerate()
+        .filter(|(_, h)| h.lodge_idx == lodge_idx)
+    {
+        let (x, y) = axial_to_pixel(h.coord.q, h.coord.r, HEX_SIZE);
+        commands.spawn((
+            Mesh2d(mesh.clone()),
+            MeshMaterial2d(mat.clone()),
+            Transform::from_xyz(x, y, HUNTER_MARKER_Z),
+            HunterMarker { hunter_idx: i },
+            WorldEntity,
+        ));
+    }
+}
+
+fn sync_hunter_markers(
+    hunters: Res<Hunters>,
+    mut markers: Query<(&HunterMarker, &mut Transform)>,
+) {
+    if !hunters.is_changed() {
+        return;
+    }
+    for (marker, mut transform) in &mut markers {
+        let Some(h) = hunters.hunters.get(marker.hunter_idx) else {
+            continue;
+        };
+        let (tx, ty) = axial_to_pixel(h.coord.q, h.coord.r, HEX_SIZE);
+        transform.translation = Vec3::new(tx, ty, HUNTER_MARKER_Z);
+    }
 }
 
 fn spawn_lodge_building(
@@ -2330,34 +2730,32 @@ fn spawn_lodge_building(
         LODGE_BUILDING_FILL,
         LODGE_BUILDING_MARGIN,
     ));
+    let outline_mesh = lodge_outline_mesh_for_rotation(meshes, rotation);
     let fill_mat = materials.add(ColorMaterial::from_color(LODGE_BUILDING_FILL));
-    commands.spawn((
-        Mesh2d(fill_mesh),
-        MeshMaterial2d(fill_mat),
-        Transform::from_xyz(origin.x, origin.y, 4.6),
-        LodgeTile,
-        LodgePlacePop { elapsed: 0.0 },
-        WorldEntity,
-    ));
-}
-
-fn lodge_place_pop_transform(t: f32) -> Transform {
-    let t = t.clamp(0.0, 1.0);
-    let eased = ease_out_cubic(t);
-    let scale = LODGE_PLACE_START_SCALE + (1.0 - LODGE_PLACE_START_SCALE) * eased;
-    Transform::from_scale(Vec3::splat(scale))
-}
-
-fn animate_lodge_place_pop(
-    time: Res<Time>,
-    mut query: Query<(&mut Transform, &mut LodgePlacePop), With<LodgeTile>>,
-) {
-    let dt = time.delta_secs();
-    for (mut transform, mut pop) in &mut query {
-        pop.elapsed += dt;
-        let t = (pop.elapsed / LODGE_PLACE_POP_SECS).min(1.0);
-        transform.scale = lodge_place_pop_transform(t).scale;
-    }
+    let outline_mat =
+        materials.add(ColorMaterial::from_color(LODGE_BLUEPRINT_STROKE_VALID));
+    commands
+        .spawn((
+            Transform {
+                translation: Vec3::new(origin.x, origin.y, 4.6),
+                scale: Vec3::ONE,
+                ..default()
+            },
+            LodgeTile,
+            WorldEntity,
+        ))
+        .with_children(|root| {
+            root.spawn((
+                Mesh2d(fill_mesh),
+                MeshMaterial2d(fill_mat),
+                Transform::from_xyz(0.0, 0.0, 0.0),
+            ));
+            root.spawn((
+                Mesh2d(outline_mesh),
+                MeshMaterial2d(outline_mat),
+                Transform::from_xyz(0.0, 0.0, 0.05),
+            ));
+        });
 }
 
 // ── Tile selection (right-click) ────────────────────────────────
@@ -2736,18 +3134,18 @@ fn on_menu_screen_changed(
     match (prev, *screen) {
         (_, MenuScreen::Closed) => {
             motion.phase = MenuMotionPhase::Exit;
-            motion.duration = MENU_EXIT_SECS;
+            motion.duration = 0.0;
             motion.exit_panel = prev;
         }
         (MenuScreen::Closed, MenuScreen::Main) => {
             cancel_lodge_placement(&mut placement_mode, &mut mesh_cache);
             motion.phase = MenuMotionPhase::Enter;
-            motion.duration = MENU_ENTER_SECS;
+            motion.duration = 0.0;
             motion.intro_panel = MenuScreen::Main;
         }
         (MenuScreen::Main, MenuScreen::Settings) | (MenuScreen::Settings, MenuScreen::Main) => {
             motion.phase = MenuMotionPhase::Switch;
-            motion.duration = MENU_SWITCH_SECS;
+            motion.duration = 0.0;
             motion.intro_panel = *screen;
         }
         _ => {
@@ -2868,7 +3266,11 @@ fn update_menu_motion(
     }
 
     motion.timer += time.delta_secs();
-    let raw_t = (motion.timer / motion.duration).min(1.0);
+    let raw_t = if motion.duration <= 0.0 {
+        1.0
+    } else {
+        (motion.timer / motion.duration).min(1.0)
+    };
 
     match motion.phase {
         MenuMotionPhase::Enter => {
@@ -2914,7 +3316,7 @@ fn update_menu_motion(
         MenuMotionPhase::Teardown | MenuMotionPhase::Idle => {}
     }
 
-    if motion.timer < motion.duration {
+    if motion.duration > 0.0 && motion.timer < motion.duration {
         return;
     }
 
@@ -3118,10 +3520,11 @@ fn handle_toggle_button(
 fn examiner_tile_fields(
     map: &Map,
     coord: HexCoord,
-) -> (String, String, String, String, Color) {
+) -> (String, String, String, String, String, Color) {
     match map.tile_at(coord) {
         None => (
             "Out of map".to_string(),
+            "—".to_string(),
             "—".to_string(),
             format_hover_coord_half("q", Some(coord.q)),
             format_hover_coord_half("r", Some(coord.r)),
@@ -3132,6 +3535,7 @@ fn examiner_tile_fields(
             terrain_category(tile.terrain)
                 .map(str::to_string)
                 .unwrap_or_else(|| "Other".to_string()),
+            examiner_game_line(tile.terrain, tile.wildlife),
             format_hover_coord_half("q", Some(coord.q)),
             format_hover_coord_half("r", Some(coord.r)),
             terrain_swatch_color(tile.terrain),
@@ -3178,8 +3582,8 @@ fn handle_examiner_click(
 }
 
 fn animate_selection_highlight(
-    time: Res<Time>,
     examiner: Res<ExaminerSelection>,
+    map: Res<GameMap>,
     placed: Res<PlacedLodges>,
     mut mesh_cache: ResMut<SelectionBuildingMeshCache>,
     mut meshes: ResMut<Assets<Mesh>>,
@@ -3215,10 +3619,6 @@ fn animate_selection_highlight(
         ),
     >,
 ) {
-    let pulse = (time.elapsed_secs() * std::f32::consts::TAU * HOVER_GLOW_PULSE_HZ).sin();
-    let scale = 1.0 + pulse * HOVER_GLOW_PULSE_SCALE;
-    let alpha = HOVER_GLOW_ALPHA_BASE + pulse * HOVER_GLOW_ALPHA_AMP;
-
     let Ok((mut tile_transform, mut tile_vis, tile_mat)) = tile_ring.get_single_mut() else {
         return;
     };
@@ -3244,10 +3644,10 @@ fn animate_selection_highlight(
             }
             let (tx, ty) = axial_to_pixel(hex.q, hex.r, HEX_SIZE);
             tile_transform.translation = Vec3::new(tx, ty, 5.2);
-            tile_transform.scale = Vec3::splat(scale);
+            tile_transform.scale = Vec3::ONE;
             *tile_vis = Visibility::Visible;
             if let Some(mat) = materials.get_mut(&tile_mat.0) {
-                mat.color = GOLD.with_alpha(alpha);
+                mat.color = adaptive_gold_stroke(tile_luminance(&map.0, hex), HOVER_GLOW_ALPHA);
             }
         }
         Some(ExaminerFocus::Building(idx)) => {
@@ -3276,26 +3676,126 @@ fn animate_selection_highlight(
             build_transform.scale = Vec3::ONE;
             *build_vis = Visibility::Visible;
             if let Ok((mut outline_tf, _, mat)) = building_outline.get_single_mut() {
-                outline_tf.scale = Vec3::splat(scale);
+                outline_tf.scale = Vec3::ONE;
                 if let Some(m) = materials.get_mut(&mat.0) {
-                    m.color = GOLD.with_alpha(alpha);
+                    let lum = footprint_luminance(&map.0, &coords);
+                    m.color = adaptive_gold_stroke(lum, HOVER_GLOW_ALPHA);
                 }
             }
         }
     }
 }
 
+struct ExaminerPanelContent {
+    name: String,
+    category: String,
+    game: String,
+    q_coord: String,
+    r_coord: String,
+    color: Color,
+    show_hint: bool,
+    show_building: bool,
+    building_name: String,
+    food: String,
+    hunters: String,
+    hunter_status: String,
+}
+
+fn compute_examiner_panel(
+    examiner: &ExaminerSelection,
+    placed: &PlacedLodges,
+    hunters: &Hunters,
+    map: &Map,
+) -> ExaminerPanelContent {
+    match examiner.0 {
+        None => ExaminerPanelContent {
+            name: "—".to_string(),
+            category: "—".to_string(),
+            game: "—".to_string(),
+            q_coord: format_hover_coord_half("q", None),
+            r_coord: format_hover_coord_half("r", None),
+            color: Color::srgb(0.35, 0.38, 0.45),
+            show_hint: true,
+            show_building: false,
+            building_name: String::new(),
+            food: String::new(),
+            hunters: String::new(),
+            hunter_status: String::new(),
+        },
+        Some(ExaminerFocus::Tile(coord)) => {
+            let (n, c, g, q, r, col) = examiner_tile_fields(map, coord);
+            ExaminerPanelContent {
+                name: n,
+                category: c,
+                game: g,
+                q_coord: q,
+                r_coord: r,
+                color: col,
+                show_hint: false,
+                show_building: false,
+                building_name: String::new(),
+                food: String::new(),
+                hunters: String::new(),
+                hunter_status: String::new(),
+            }
+        }
+        Some(ExaminerFocus::Building(idx)) => {
+            let Some(lodge) = placed.lodges.get(idx) else {
+                return ExaminerPanelContent {
+                    name: "—".to_string(),
+                    category: "—".to_string(),
+                    game: "—".to_string(),
+                    q_coord: format_hover_coord_half("q", None),
+                    r_coord: format_hover_coord_half("r", None),
+                    color: Color::srgb(0.35, 0.38, 0.45),
+                    show_hint: true,
+                    show_building: false,
+                    building_name: String::new(),
+                    food: String::new(),
+                    hunters: String::new(),
+                    hunter_status: String::new(),
+                };
+            };
+            let (n, c, g, q, r, col) = examiner_tile_fields(map, lodge.anchor);
+            ExaminerPanelContent {
+                name: n,
+                category: c,
+                game: g,
+                q_coord: q,
+                r_coord: r,
+                color: col,
+                show_hint: false,
+                show_building: true,
+                building_name: "Hunting Lodge".to_string(),
+                food: lodge.food_stored.to_string(),
+                hunters: hunters.count_for_lodge(idx).to_string(),
+                hunter_status: hunters.status_line(idx),
+            }
+        }
+    }
+}
+
+fn examiner_panel_needs_refresh(
+    _examiner: &ExaminerSelection,
+    examiner_changed: bool,
+    map_changed: bool,
+    placed_changed: bool,
+    hunters_changed: bool,
+) -> bool {
+    examiner_changed || map_changed || placed_changed || hunters_changed
+}
+
 fn update_examiner_panel(
     examiner: Res<ExaminerSelection>,
     placed: Res<PlacedLodges>,
+    hunters: Res<Hunters>,
     map: Res<GameMap>,
     mut texts: ParamSet<(
         Query<&mut Text, With<HoverNameText>>,
         Query<&mut Text, With<HoverCategoryText>>,
+        Query<&mut Text, With<HoverGameText>>,
         Query<&mut Text, With<HoverCoordsQ>>,
         Query<&mut Text, With<HoverCoordsR>>,
-        Query<&mut Text, With<ExaminerBuildingNameText>>,
-        Query<&mut Text, With<ExaminerBuildingFoodText>>,
     )>,
     mut swatch: Query<&mut BackgroundColor, With<HoverSwatch>>,
     mut hint: Query<
@@ -3319,8 +3819,13 @@ fn update_examiner_panel(
         ),
     >,
 ) {
-    let building_selected = matches!(examiner.0, Some(ExaminerFocus::Building(_)));
-    if !examiner.is_changed() && !(building_selected && placed.is_changed()) {
+    if !examiner_panel_needs_refresh(
+        &examiner,
+        examiner.is_changed(),
+        map.is_changed(),
+        placed.is_changed(),
+        hunters.is_changed(),
+    ) {
         return;
     }
 
@@ -3337,86 +3842,90 @@ fn update_examiner_panel(
         return;
     };
 
-    let (name, category, q_coord, r_coord, color, show_hint, show_building, building_name, food) =
-        match examiner.0 {
-            None => (
-                "—".to_string(),
-                "—".to_string(),
-                format_hover_coord_half("q", None),
-                format_hover_coord_half("r", None),
-                Color::srgb(0.35, 0.38, 0.45),
-                true,
-                false,
-                String::new(),
-                String::new(),
-            ),
-            Some(ExaminerFocus::Tile(coord)) => {
-                let (n, c, q, r, col) = examiner_tile_fields(&map.0, coord);
-                (n, c, q, r, col, false, false, String::new(), String::new())
-            }
-            Some(ExaminerFocus::Building(idx)) => {
-                let Some(lodge) = placed.lodges.get(idx) else {
-                    return;
-                };
-                let (n, c, q, r, col) = examiner_tile_fields(&map.0, lodge.anchor);
-                (
-                    n,
-                    c,
-                    q,
-                    r,
-                    col,
-                    false,
-                    true,
-                    "Hunting Lodge".to_string(),
-                    lodge.food_stored.to_string(),
-                )
-            }
-        };
+    let panel = compute_examiner_panel(&examiner, &placed, &hunters, &map.0);
 
-    *hint = if show_hint {
+    *hint = if panel.show_hint {
         Visibility::Visible
     } else {
         Visibility::Hidden
     };
-    *block_vis = if show_building {
+    *block_vis = if panel.show_building {
         Visibility::Visible
     } else {
         Visibility::Hidden
     };
-    block_node.display = if show_building {
+    block_node.display = if panel.show_building {
         Display::Flex
     } else {
         Display::None
     };
-    *divider_vis = if show_building {
+    *divider_vis = if panel.show_building {
         Visibility::Visible
     } else {
         Visibility::Hidden
     };
-    divider_node.display = if show_building {
+    divider_node.display = if panel.show_building {
         Display::Flex
     } else {
         Display::None
     };
-    swatch.0 = color;
+    swatch.0 = panel.color;
 
     if let Ok(mut text) = texts.p0().get_single_mut() {
-        text.0 = name;
+        text.0 = panel.name;
     }
     if let Ok(mut text) = texts.p1().get_single_mut() {
-        text.0 = category;
+        text.0 = panel.category;
     }
     if let Ok(mut text) = texts.p2().get_single_mut() {
-        text.0 = q_coord;
+        text.0 = panel.game;
     }
     if let Ok(mut text) = texts.p3().get_single_mut() {
-        text.0 = r_coord;
+        text.0 = panel.q_coord;
     }
     if let Ok(mut text) = texts.p4().get_single_mut() {
-        text.0 = building_name;
+        text.0 = panel.r_coord;
     }
-    if let Ok(mut text) = texts.p5().get_single_mut() {
-        text.0 = food;
+}
+
+fn update_examiner_building_texts(
+    examiner: Res<ExaminerSelection>,
+    placed: Res<PlacedLodges>,
+    hunters: Res<Hunters>,
+    map: Res<GameMap>,
+    mut texts: ParamSet<(
+        Query<&mut Text, With<ExaminerBuildingNameText>>,
+        Query<&mut Text, With<ExaminerBuildingFoodText>>,
+        Query<&mut Text, With<ExaminerBuildingHuntersText>>,
+        Query<&mut Text, With<ExaminerBuildingStatusText>>,
+    )>,
+) {
+    if !examiner_panel_needs_refresh(
+        &examiner,
+        examiner.is_changed(),
+        map.is_changed(),
+        placed.is_changed(),
+        hunters.is_changed(),
+    ) {
+        return;
+    }
+
+    let panel = compute_examiner_panel(&examiner, &placed, &hunters, &map.0);
+
+    if !panel.show_building {
+        return;
+    }
+    if let Ok(mut text) = texts.p0().get_single_mut() {
+        text.0 = panel.building_name;
+    }
+    if let Ok(mut text) = texts.p1().get_single_mut() {
+        text.0 = panel.food;
+    }
+    if let Ok(mut text) = texts.p2().get_single_mut() {
+        text.0 = panel.hunters;
+    }
+    if let Ok(mut text) = texts.p3().get_single_mut() {
+        text.0 = panel.hunter_status;
     }
 }
 
@@ -3470,15 +3979,20 @@ fn terrain_category(t: TerrainType) -> Option<&'static str> {
 fn end_turn(
     keys: Res<ButtonInput<KeyCode>>,
     screen: Res<MenuScreen>,
+    seed: Res<CurrentSeed>,
     mut gs: ResMut<GameState>,
     mut query: Query<&mut Text, With<TurnText>>,
-    map: Res<GameMap>,
+    mut map: ResMut<GameMap>,
+    mut placed: ResMut<PlacedLodges>,
+    mut hunters: ResMut<Hunters>,
 ) {
     let advance = keys.just_pressed(KeyCode::Space) || keys.just_pressed(KeyCode::Enter);
     if !advance || pause_menu_open(&screen) {
         return;
     }
     gs.next_turn(&map.0);
+    wildlife_turn_tick(&mut map.0, &placed, seed.0, gs.turn);
+    hunters_turn_tick(&mut hunters, &mut placed, &mut map.0, &gs);
     if let Ok(mut text) = query.get_single_mut() {
         text.0 = gs.turn.to_string();
     }
@@ -3492,7 +4006,6 @@ fn reroll_world(
     mut gs: ResMut<GameState>,
     mut game_map: ResMut<GameMap>,
     mut seed_res: ResMut<CurrentSeed>,
-    mut zoom: ResMut<Zoom>,
     window: Query<&Window, With<PrimaryWindow>>,
     mut cameras: Query<(&mut Transform, &mut OrthographicProjection), With<Camera2d>>,
     mut text_queries: ParamSet<(
@@ -3500,10 +4013,10 @@ fn reroll_world(
         Query<&mut Text, With<SeedText>>,
     )>,
     world_entities: Query<Entity, With<WorldEntity>>,
-    mut selected: ResMut<SelectedHex>,
-    mut hovered: ResMut<HoveredHex>,
     mut placement_mode: ResMut<BuildingPlacementMode>,
     mut placed_lodges: ResMut<PlacedLodges>,
+    mut hunters: ResMut<Hunters>,
+    game_font: Res<GameLabelFont>,
 ) {
     if !keys.just_pressed(KeyCode::Backslash) {
         return;
@@ -3515,12 +4028,20 @@ fn reroll_world(
 
     *placement_mode = BuildingPlacementMode::Idle;
     *placed_lodges = PlacedLodges::default();
+    hunters.clear();
 
     let seed = rand::thread_rng().gen::<u64>();
     seed_res.0 = seed;
     println!("World rerolled with seed: {seed}");
 
-    let (map, new_gs) = spawn_world_entities(&mut commands, &mut meshes, &mut materials, seed);
+    let (map, new_gs) = spawn_world_entities(
+        &mut commands,
+        &mut meshes,
+        &mut materials,
+        seed,
+        &game_font,
+        false,
+    );
     game_map.0 = map;
     *gs = new_gs;
 
@@ -3528,19 +4049,17 @@ fn reroll_world(
         let window_size = Vec2::new(window.width(), window.height());
         if window_size.x > 0.0 && window_size.y > 0.0 {
             if let Ok((mut transform, mut projection)) = cameras.get_single_mut() {
+                let mut zoom_out = 0.0_f32;
                 apply_camera_frame_to_tiles(
                     &game_map.0.tiles,
                     window_size,
                     &mut transform,
                     &mut projection,
-                    &mut zoom.0,
+                    &mut zoom_out,
                 );
             }
         }
     }
-
-    selected.0 = None;
-    hovered.0 = None;
 
     if let Ok(mut text) = text_queries.p0().get_single_mut() {
         text.0 = "1".to_string();
